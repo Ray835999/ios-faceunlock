@@ -28,6 +28,7 @@
 #import <CoreImage/CoreImage.h>
 #import <math.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 #define FU_LOG(fmt, ...) NSLog(@"[FaceUnlock] " fmt, ##__VA_ARGS__)
 
@@ -186,14 +187,11 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
         return;
     }
 
-    AVCaptureDevice *cam = [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera
-                                                             mediaType:AVMediaTypeVideo
-                                                              position:AVCaptureDevicePositionFront];
-    if (!cam) {
-        for (AVCaptureDevice *d in [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo]) {
-            if (d.position == AVCaptureDevicePositionFront) { cam = d; break; }
-        }
-    }
+    AVCaptureDeviceDiscoverySession *disc =
+        [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+                                                              mediaType:AVMediaTypeVideo
+                                                               position:AVCaptureDevicePositionFront];
+    AVCaptureDevice *cam = disc.devices.firstObject;
     if (!cam) { FU_LOG("startScanning: no front camera found"); return; }
 
     NSError *err = nil;
@@ -213,7 +211,6 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
     if (![session canAddOutput:out]) { FU_LOG("startScanning: cannot add video output"); return; }
     [session addOutput:out];
     AVCaptureConnection *conn = [out connectionWithMediaType:AVMediaTypeVideo];
-    if (conn.isCameraIntrinsicMatrixDeliverySupported) conn.cameraIntrinsicMatrixDelivery = YES;
     if (conn.supportsVideoOrientation) conn.videoOrientation = AVCaptureVideoOrientationPortrait;
 
     _consecutive   = 0;
@@ -377,7 +374,12 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
     NSData *arch = rec[@"arch"];
     if ([arch isKindOfClass:[NSData class]]) {
         @try {
-            id tObs = [NSKeyedUnarchiver unarchiveObjectWithData:arch];
+            // allow the observation class and its private subclass (faceprints)
+            NSMutableSet *classes = [NSMutableSet setWithObject:[VNFeaturePrintObservation class]];
+            Class fpObs = NSClassFromString(@"VNFaceFeaturePrintObservation");
+            if (fpObs) [classes addObject:fpObs];
+            NSError *uerr = nil;
+            id tObs = [NSKeyedUnarchiver unarchivedObjectOfClasses:classes fromData:arch error:&uerr];
             if ([tObs isKindOfClass:[VNFeaturePrintObservation class]]) {
                 float d = 0;
                 NSError *e = nil;
@@ -460,7 +462,7 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
     id lockMgr = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
     SEL sel = @selector(lockScreenViewControllerRequestsUnlock);
     if (lockMgr && [lockMgr respondsToSelector:sel]) {
-        [lockMgr performSelector:sel];
+        ((void (*)(id, SEL))objc_msgSend)(lockMgr, sel);
         FU_LOG("lockScreenViewControllerRequestsUnlock sent");
     } else {
         FU_LOG("SBLockScreenManager / lockScreenViewControllerRequestsUnlock unavailable");
