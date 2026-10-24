@@ -3,9 +3,7 @@
 //
 
 #import <UIKit/UIKit.h>
-
-// AVFoundation protocol, forward-declared to keep this header light.
-@protocol AVCaptureVideoDataOutputSampleBufferDelegate;
+#import <AVFoundation/AVFoundation.h>
 
 @interface FUSAppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
