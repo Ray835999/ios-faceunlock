@@ -252,10 +252,10 @@ typedef NS_ENUM(NSInteger, FUSRow) {
                                                      action:@selector(cancelTapped)];
 
     // camera preview (full screen)
-    AVCaptureVideoPreviewLayer *preview = [AVCaptureVideoPreviewLayer new];
-    preview.videoGravity = AVLayerVideoGravityResizeAspectFill;
-    preview.frame = self.view.bounds;
-    [self.view.layer addSublayer:preview];
+    _preview = [AVCaptureVideoPreviewLayer new];
+    _preview.videoGravity = AVLayerVideoGravityResizeAspectFill;
+    _preview.frame = self.view.bounds;
+    [self.view.layer addSublayer:_preview];
 
     // face guide frame
     CGFloat side = MIN(self.view.bounds.size.width, self.view.bounds.size.height) * 0.55;
@@ -336,75 +336,64 @@ typedef NS_ENUM(NSInteger, FUSRow) {
         _statusLabel.text = @"相机权限被拒绝：请在 设置 > FaceUnlock 中允许访问相机";
         return;
     }
-    void (^configure)(void) = ^{
-        AVCaptureDeviceDiscoverySession *disc =
-            [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
-                                                                  mediaType:AVMediaTypeVideo
-                                                                   position:AVCaptureDevicePositionFront];
-        AVCaptureDevice *cam = disc.devices.firstObject;
-        if (!cam) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self->_statusLabel.text = @"未找到前置摄像头";
-            });
-            return;
-        }
-        NSError *err = nil;
-        AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:cam error:&err];
-        if (!input) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self->_statusLabel.text = [NSString stringWithFormat:@"摄像头打开失败：%@",
-                                           err.localizedDescription ?: @"?"];
-            });
-            return;
-        }
-        AVCaptureSession *session = [AVCaptureSession new];
-        session.sessionPreset = AVCaptureSessionPreset640x480;
-        if (![session canAddInput:input]) {
-            dispatch_async(dispatch_get_main_queue(), ^{ self->_statusLabel.text = @"摄像头配置失败"; });
-            return;
-        }
-        [session addInput:input];
-
-        AVCaptureVideoDataOutput *out = [AVCaptureVideoDataOutput new];
-        out.alwaysDiscardsLateVideoFrames = YES;
-        out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
-        [out setSampleBufferDelegate:self queue:self->_captureQueue];
-        if (![session canAddOutput:out]) {
-            dispatch_async(dispatch_get_main_queue(), ^{ self->_statusLabel.text = @"摄像头配置失败"; });
-            return;
-        }
-        [session addOutput:out];
-        AVCaptureConnection *conn = [out connectionWithMediaType:AVMediaTypeVideo];
-        if (conn.supportsVideoOrientation) conn.videoOrientation = AVCaptureVideoOrientationPortrait;
-
-        self->_session = session;
-        self->_output  = out;
-        // attach preview layer
-        dispatch_async(dispatch_get_main_queue(), ^{
-            AVCaptureVideoPreviewLayer *preview = (AVCaptureVideoPreviewLayer *)self.view.layer.sublayers.firstObject;
-            preview.session = session;
-            [session startRunning];
-        });
-    };
-
+    // configure on the main thread (UIKit/AVCaptureSession setup), start on the
+    // capture queue so startRunning never blocks the UI
     if (status == AVAuthorizationStatusNotDetermined) {
         [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
-            if (granted) configure();
-            else dispatch_async(dispatch_get_main_queue(), ^{
-                self->_statusLabel.text = @"需要相机权限才能录入人脸";
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (granted) [self configureCamera];
+                else self->_statusLabel.text = @"需要相机权限才能录入人脸";
             });
         }];
     } else {
-        configure();
+        [self configureCamera];
     }
 }
 
-- (void)stopCamera {
-    if (_session) {
-        [_session stopRunning];
-        _session = nil;
+- (void)configureCamera {
+    AVCaptureDeviceDiscoverySession *disc =
+        [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+                                                              mediaType:AVMediaTypeVideo
+                                                               position:AVCaptureDevicePositionFront];
+    AVCaptureDevice *cam = disc.devices.firstObject;
+    if (!cam) { _statusLabel.text = @"未找到前置摄像头"; return; }
+    NSError *err = nil;
+    AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:cam error:&err];
+    if (!input) {
+        _statusLabel.text = [NSString stringWithFormat:@"摄像头打开失败：%@",
+                             err.localizedDescription ?: @"?"];
+        return;
     }
-    _output = nil;
+    AVCaptureSession *session = [AVCaptureSession new];
+    session.sessionPreset = AVCaptureSessionPreset640x480;
+    if (![session canAddInput:input]) { _statusLabel.text = @"摄像头配置失败"; return; }
+    [session addInput:input];
+
+    AVCaptureVideoDataOutput *out = [AVCaptureVideoDataOutput new];
+    out.alwaysDiscardsLateVideoFrames = YES;
+    out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
+    [out setSampleBufferDelegate:self queue:_captureQueue];
+    if (![session canAddOutput:out]) { _statusLabel.text = @"摄像头配置失败"; return; }
+    [session addOutput:out];
+    AVCaptureConnection *conn = [out connectionWithMediaType:AVMediaTypeVideo];
+    if (conn.supportsVideoOrientation) conn.videoOrientation = AVCaptureVideoOrientationPortrait;
+
+    _session = session;
+    _output  = out;
+    _preview.session = session;
+    dispatch_async(_captureQueue, ^{ [session startRunning]; });
+}
+
+- (void)stopCamera {
+    AVCaptureSession *session = _session;
+    _session = nil;
+    _output  = nil;
+    if (_preview) _preview.session = nil;
+    if (session) {
+        // stop on the same queue that started it
+        if (_captureQueue) dispatch_async(_captureQueue, ^{ [session stopRunning]; });
+        else [session stopRunning];
+    }
 }
 
 #pragma mark - capture delegate
