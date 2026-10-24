@@ -1,0 +1,42 @@
+name: build-faceunlock
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Tweak.xm'
+      - 'Makefile'
+      - 'control'
+      - '*.plist'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xz
+        run: sudo apt-get update && sudo apt-get install -y xz-utils
+
+      - name: Set up Theos + iPhoneOS 15.6 SDK + toolchain
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
+          curl -sL https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS15.6.sdk.tar.xz | tar -xJf - -C "$THEOS/sdks"
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJf - -C "$THEOS/toolchain"
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Build rootless deb
+        run: make package THEOS_PACKAGE_SCHEME=rootless
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: faceunlock-deb
+          path: packages/*.deb
+          if-no-files-found: error
