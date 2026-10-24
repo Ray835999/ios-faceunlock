@@ -14,15 +14,18 @@
 //      SBLockScreenManager lockScreenViewControllerRequestsUnlock
 //      (the same unlock-completion call FastUnlockX uses).
 //
-//  Crash-safety rules (Safe Mode post-mortem, v1.0.1 + v1.2.0):
+//  Crash-safety rules (Safe Mode post-mortem, v1.0.1 + v1.2.x):
 //   - %ctor must NOT touch SpringBoard singletons, register notifications, or
 //     call any API beyond a single NSLog. Tweaks are loaded at dyld time,
 //     before SpringBoard is initialized; setUp() is deferred to the first
 //     lock-screen appearance.
-//   - Vision and AVFoundation are WEAK-LINKED in this tweak. Every class is
-//     resolved with NSClassFromString and every extern constant is NULL-checked,
-//     so a framework that fails to load inside SpringBoard disables the feature
-//     with a log line instead of killing the process.
+//   - Vision / AVFoundation / CoreMedia / CoreVideo are WEAK-LINKED and end up
+//     with NO load command in this dylib at all, so dyld loads nothing
+//     framework-related when injecting into SpringBoard. They are dlopen()ed at
+//     runtime from setUp() (after SpringBoard is initialized) and every class
+//     is resolved with NSClassFromString / every extern constant NULL-checked,
+//     so a framework that fails to load logs one line and disables the feature
+//     instead of killing the process.
 //   - Every hook body and the entire capture pipeline is wrapped in
 //     @try/@catch: an NSException escaping into SpringBoard is a crash.
 //   - AVCaptureSession is owned by the capture queue; the main thread only
@@ -44,6 +47,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <notify.h>
+#import <dlfcn.h>
 
 #import "FacePrint.h"
 
@@ -88,6 +92,22 @@ static float FUPrefFloat(NSString *key, float def) {
 
 // AVFoundation classes, resolved at runtime (weak framework in the tweak).
 static Class FUAV(NSString *name) { return NSClassFromString(name); }
+
+// The tweak does NOT carry load commands for these frameworks (weak link, no
+// strong symbol references), so dyld loads nothing framework-related at
+// injection time. They are dlopen()ed at runtime instead — after SpringBoard is
+// initialized — so a broken/missing framework disables the feature with a log
+// line instead of killing the process.
+static void FULoadOptionalFrameworks(void) {
+    @autoreleasepool {
+        void *cm = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
+        FU_LOG("dlopen CoreMedia: %s", cm ? "ok" : (dlerror() ?: "failed"));
+        void *av = dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
+        FU_LOG("dlopen AVFoundation: %s", av ? "ok" : (dlerror() ?: "failed"));
+        void *vi = dlopen("/System/Library/Frameworks/Vision.framework/Vision", RTLD_LAZY);
+        FU_LOG("dlopen Vision: %s", vi ? "ok" : (dlerror() ?: "failed"));
+    }
+}
 
 // True when AVFoundation + the constants the capture path needs are present.
 // (Weak-linked extern NSString constants are NULL when the framework is absent.)
@@ -188,6 +208,10 @@ static BOOL FUKillSwitchEngaged(void) {
             [[FaceUnlockManager sharedManager] reloadTemplates];
         });
     }
+
+    // Runtime-load the optional frameworks (they are NOT linked into this
+    // dylib, so nothing framework-related can fail at dyld load time).
+    FULoadOptionalFrameworks();
 
     BOOL passcode = YES;
     id lockMgr = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
