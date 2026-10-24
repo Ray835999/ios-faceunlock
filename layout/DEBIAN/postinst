@@ -1,0 +1,14 @@
+#!/bin/sh
+# FaceUnlock postinst
+#
+# dpkg installs bypass installd, so the companion app's icon will not appear
+# on the home screen until uicache re-registers the app list. This is required
+# for FaceUnlockSettings to show up (and for Settings > FaceUnlock to exist).
+# Never fail the install because of this.
+if [ -x /var/jb/usr/bin/uicache ]; then
+    /var/jb/usr/bin/uicache 2>/dev/null || true
+elif command -v uicache >/dev/null 2>&1; then
+    uicache 2>/dev/null || true
+fi
+
+exit 0
