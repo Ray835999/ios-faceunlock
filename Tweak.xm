@@ -452,7 +452,7 @@ static inline FaceUnlockManager *FUMgr(void) { return [FaceUnlockManager sharedM
     @autoreleasepool {
         FU_LOG("ctor: injecting into %@", [[NSBundle mainBundle] bundleIdentifier] ?: @"?");
         // hot-reload templates when FaceUnlockSettings changes enrollment
-        notify_register_dispatch(((__bridge NSString *)kTemplatesChangedNotify).UTF8String, NULL,
+        notify_register_dispatch(kTemplatesChangedNotify.UTF8String, NULL,
                                  dispatch_get_main_queue(), ^(int token) {
             [[FaceUnlockManager sharedManager] reloadTemplates];
         });
