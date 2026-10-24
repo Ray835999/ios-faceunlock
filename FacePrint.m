@@ -170,9 +170,9 @@ static NSString *const kTemplateFile = @"/var/jb/var/mobile/Library/FaceUnlock/t
 }
 
 #pragma mark - distance
-+ (float)distanceFromTemplate:(NSDictionary *)rec
++ (float)distanceFromTemplate:(NSDictionary *)tmpl
                       toPrint:(VNFeaturePrintObservation *)print {
-    NSData *arch = rec[@"arch"];
+    NSData *arch = tmpl[@"arch"];
     if ([arch isKindOfClass:[NSData class]] && arch.length > 0) {
         @try {
             // allow the observation class and its private subclass (faceprints)
@@ -193,10 +193,10 @@ static NSString *const kTemplateFile = @"/var/jb/var/mobile/Library/FaceUnlock/t
     }
     // raw-vector Euclidean fallback (Apple's computeDistance is a plain
     // Euclidean distance over the print vector; elementType gives float/double)
-    NSData *a = rec[@"vec"];
+    NSData *a = tmpl[@"vec"];
     if (![a isKindOfClass:[NSData class]] || !print.data) return INFINITY;
-    NSUInteger n = [rec[@"n"] unsignedIntegerValue];
-    BOOL isDouble = ([rec[@"t"] integerValue] == VNElementTypeDouble);
+    NSUInteger n = [tmpl[@"n"] unsignedIntegerValue];
+    BOOL isDouble = ([tmpl[@"t"] integerValue] == VNElementTypeDouble);
     size_t elem = isDouble ? sizeof(double) : sizeof(float);
     if (n == 0 || a.length < n * elem || print.data.length < n * elem) return INFINITY;
     double sum = 0;
