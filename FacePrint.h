@@ -31,7 +31,7 @@
 
 // Distance between a stored template and a live print.
 // VNFeaturePrintObservation computeDistance: first, raw-vector Euclidean fallback.
-+ (float)distanceFromTemplate:(NSDictionary *)template
++ (float)distanceFromTemplate:(NSDictionary *)tmpl
                       toPrint:(VNFeaturePrintObservation *)print;
 
 @end
