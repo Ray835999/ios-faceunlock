@@ -39,8 +39,12 @@ for path in sorted(files):
     rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
     with open(path, "rb") as f:
         content = base64.b64encode(f.read()).decode()
-    st, resp = api("PUT", f"/repos/{REPO}/contents/{rel}",
-                   {"message": f"add {rel}", "content": content, "branch": "main"})
+    # existing file -> need its blob sha for update
+    st, resp = api("GET", f"/repos/{REPO}/contents/{rel}?ref=main")
+    payload = {"message": f"update {rel}", "content": content, "branch": "main"}
+    if st == 200 and isinstance(resp, dict) and resp.get("sha"):
+        payload["sha"] = resp["sha"]
+    st, resp = api("PUT", f"/repos/{REPO}/contents/{rel}", payload)
     if st in (200, 201):
         ok += 1
         print(f"  OK   {rel}")
