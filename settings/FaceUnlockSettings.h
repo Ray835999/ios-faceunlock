@@ -13,4 +13,7 @@
 @end
 
 @interface FUSEnrollViewController : UIViewController <AVCaptureVideoDataOutputSampleBufferDelegate>
+{
+    AVCaptureVideoPreviewLayer *_preview;
+}
 @end
