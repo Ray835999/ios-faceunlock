@@ -252,7 +252,7 @@ typedef NS_ENUM(NSInteger, FUSRow) {
                                                      action:@selector(cancelTapped)];
 
     // camera preview (full screen)
-    AVCaptureVideoPreviewLayer *preview = [AVCaptureVideoPreviewLayer layerWithSession:nil];
+    AVCaptureVideoPreviewLayer *preview = [AVCaptureVideoPreviewLayer new];
     preview.videoGravity = AVLayerVideoGravityResizeAspectFill;
     preview.frame = self.view.bounds;
     [self.view.layer addSublayer:preview];
