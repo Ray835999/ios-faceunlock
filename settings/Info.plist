@@ -13,9 +13,15 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.0</string>
+	<string>1.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1.1.0</string>
+	<string>1.2.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
 	<key>CFBundleIconFiles</key>
 	<array>
 		<string>AppIcon60x60</string>
@@ -40,11 +46,6 @@
 	<dict/>
 	<key>NSCameraUsageDescription</key>
 	<string>FaceUnlock 需要使用前置摄像头采集人脸特征，用于锁屏人脸解锁。</string>
-	<key>UIApplicationSceneManifest</key>
-	<dict>
-		<key>UIApplicationSupportsMultipleScenes</key>
-		<false/>
-	</dict>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
