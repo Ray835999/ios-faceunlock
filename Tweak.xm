@@ -14,11 +14,15 @@
 //      SBLockScreenManager lockScreenViewControllerRequestsUnlock
 //      (the same unlock-completion call FastUnlockX uses).
 //
-//  Crash-safety rules (Safe Mode post-mortem):
-//   - %ctor must NOT touch SpringBoard singletons. Tweaks are loaded at dyld
-//     time, before SpringBoard is initialized; +[SBLockScreenManager
-//     sharedInstance] there is a guaranteed crash. setUp() is deferred to the
-//     first lock-screen appearance.
+//  Crash-safety rules (Safe Mode post-mortem, v1.0.1 + v1.2.0):
+//   - %ctor must NOT touch SpringBoard singletons, register notifications, or
+//     call any API beyond a single NSLog. Tweaks are loaded at dyld time,
+//     before SpringBoard is initialized; setUp() is deferred to the first
+//     lock-screen appearance.
+//   - Vision and AVFoundation are WEAK-LINKED in this tweak. Every class is
+//     resolved with NSClassFromString and every extern constant is NULL-checked,
+//     so a framework that fails to load inside SpringBoard disables the feature
+//     with a log line instead of killing the process.
 //   - Every hook body and the entire capture pipeline is wrapped in
 //     @try/@catch: an NSException escaping into SpringBoard is a crash.
 //   - AVCaptureSession is owned by the capture queue; the main thread only
@@ -26,6 +30,8 @@
 //     teardown from clearing a freshly started session's gates.
 //   - Templates are mutated on the capture queue and read on the main thread,
 //     so every access is @synchronized.
+//   - Kill switch: create /var/jb/var/mobile/Library/FaceUnlock/DISABLED to
+//     stop all hook activity without uninstalling.
 //
 
 #import <Foundation/Foundation.h>
@@ -48,6 +54,10 @@ static NSString *const kPrefsAppID = @"com.ray835999.faceunlock";
 // Darwin notification posted by FaceUnlockSettings after enrollment changes.
 static NSString *const kTemplatesChangedNotify =
     @"com.ray835999.faceunlock.templates-changed";
+
+// Touch this file to disable the tweak at runtime (no uninstall needed).
+static NSString *const kKillSwitchPath =
+    @"/var/jb/var/mobile/Library/FaceUnlock/DISABLED";
 
 static const NSTimeInterval kScanWindow        = 12.0;  // auto-stop without a match
 static const NSTimeInterval kAnalysisInterval  = 0.35;  // ~3 fps
@@ -74,6 +84,24 @@ static float FUPrefFloat(NSString *key, float def) {
     if (t == CFBooleanGetTypeID() || t == CFNumberGetTypeID()) f = [(__bridge NSNumber *)v floatValue];
     CFRelease(v);
     return f;
+}
+
+// AVFoundation classes, resolved at runtime (weak framework in the tweak).
+static Class FUAV(NSString *name) { return NSClassFromString(name); }
+
+// True when AVFoundation + the constants the capture path needs are present.
+// (Weak-linked extern NSString constants are NULL when the framework is absent.)
+static BOOL FUAVFoundationAvailable(void) {
+    return (FUAV(@"AVCaptureDevice") != nil
+         && FUAV(@"AVCaptureDeviceInput") != nil
+         && FUAV(@"AVCaptureSession") != nil
+         && FUAV(@"AVCaptureVideoDataOutput") != nil
+         && FUAV(@"AVCaptureConnection") != nil
+         && FUAV(@"AVCaptureDeviceDiscoverySession") != nil
+         && AVCaptureDeviceTypeBuiltInWideAngleCamera != NULL
+         && AVMediaTypeVideo != NULL
+         && AVCaptureSessionPreset640x480 != NULL
+         && kCVPixelBufferPixelFormatTypeKey != NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +146,7 @@ static float FUPrefFloat(NSString *key, float def) {
     id                 _templatesLock;
     BOOL               _setUpDone;
     BOOL               _passcodeSet;
+    BOOL               _notifyRegistered;
 }
 
 + (instancetype)sharedManager {
@@ -137,12 +166,29 @@ static float FUPrefFloat(NSString *key, float def) {
     return self;
 }
 
-// Deferred from %ctor on purpose: this touches SpringBoard singletons and is
-// only safe once SpringBoard is fully initialized (first lock-screen appear).
+static BOOL FUKillSwitchEngaged(void) {
+    return [[NSFileManager defaultManager] fileExistsAtPath:kKillSwitchPath];
+}
+
+// Deferred from %ctor on purpose: this touches SpringBoard singletons and
+// Darwin notifications, and is only safe once SpringBoard is fully initialized
+// (first lock-screen appearance).
 - (void)setUp {
     if (_setUpDone) return;
     _setUpDone = YES;
     [self reloadTemplates];
+
+    // hot-reload templates when FaceUnlockSettings changes enrollment.
+    // Registered here (not in %ctor): notify_register_dispatch is only safe
+    // after the host process is initialized.
+    if (!_notifyRegistered) {
+        _notifyRegistered = YES;
+        notify_register_dispatch(kTemplatesChangedNotify.UTF8String, NULL,
+                                 dispatch_get_main_queue(), ^(int token) {
+            [[FaceUnlockManager sharedManager] reloadTemplates];
+        });
+    }
+
     BOOL passcode = YES;
     id lockMgr = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
     if (lockMgr && [lockMgr respondsToSelector:@selector(isPasscodeSet)]) {
@@ -151,10 +197,13 @@ static float FUPrefFloat(NSString *key, float def) {
     _passcodeSet = passcode;
     NSUInteger enrolled = 0;
     @synchronized (_templatesLock) { enrolled = _templates.count; }
-    FU_LOG("loaded: enabled=%d threshold=%.3f enrolled=%lu passcodeSet=%d",
+    FU_LOG("loaded: enabled=%d threshold=%.3f enrolled=%lu passcodeSet=%d vision=%d avfoundation=%d",
            FUPrefBool(@"Enabled", YES), FUPrefFloat(@"Threshold", 0.5),
-           (unsigned long)enrolled, passcode);
+           (unsigned long)enrolled, passcode,
+           [FacePrint visionAvailable], FUAVFoundationAvailable());
     if (!FUPrefBool(@"Enabled", YES)) FU_LOG("tweak disabled via prefs (Enabled=NO)");
+    if (![FacePrint visionAvailable])   FU_LOG("Vision unavailable in this process - face unlock disabled");
+    if (!FUAVFoundationAvailable())     FU_LOG("AVFoundation unavailable in this process - face unlock disabled");
     if (!passcode) FU_LOG("no lock screen passcode set - face unlock needs a passcode (same as Vizage)");
     if (enrolled == 0) FU_LOG("no faceprints yet - enroll in the FaceUnlockSettings app");
 }
@@ -175,8 +224,11 @@ static float FUPrefFloat(NSString *key, float def) {
 // main thread: arm/disarm gates only; the session itself lives on _captureQueue
 - (void)startScanning {
     if (_sessionActive) return;
-    if (!self.enabled) { FU_LOG("startScanning: disabled by prefs"); return; }
-    if (!_passcodeSet) return;   // nothing to unlock without a passcode
+    if (FUKillSwitchEngaged())      { FU_LOG("startScanning: DISABLED kill switch present"); return; }
+    if (!self.enabled)              { FU_LOG("startScanning: disabled by prefs"); return; }
+    if (!_passcodeSet)              { return; }   // nothing to unlock without a passcode
+    if (![FacePrint visionAvailable])   { return; }
+    if (!FUAVFoundationAvailable())     { return; }
 
     NSUInteger enrolled = 0;
     @synchronized (_templatesLock) { enrolled = _templates.count; }
@@ -207,27 +259,48 @@ static float FUPrefFloat(NSString *key, float def) {
 // capture queue only: create + start the session (or log why we cannot)
 - (void)setupAndRunSessionGen:(NSUInteger)gen {
     @try {
+        if (!FUAVFoundationAvailable()) {
+            FU_LOG("startScanning: AVFoundation unavailable - face unlock disabled");
+            [self finishSessionOnQueue];
+            return;
+        }
+
+        // Log the camera authorization state: in a process without camera
+        // entitlement (e.g. SpringBoard) this shows up as notDetermined and
+        // the session will simply never deliver frames.
+        @try {
+            AVAuthorizationStatus st =
+                ((AVAuthorizationStatus (*)(id, SEL, id))objc_msgSend)(
+                    FUAV(@"AVCaptureDevice"), @selector(authorizationStatusForMediaType:),
+                    (id)AVMediaTypeVideo);
+            FU_LOG("camera authorization status: %ld", (long)st);
+        } @catch (NSException *ex) {
+            FU_LOG("camera authorization probe failed: %@", ex.reason);
+        }
+
         AVCaptureDeviceDiscoverySession *disc =
-            [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
-                                                                  mediaType:AVMediaTypeVideo
-                                                                   position:AVCaptureDevicePositionFront];
+            [(id)FUAV(@"AVCaptureDeviceDiscoverySession")
+                discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+                                      mediaType:AVMediaTypeVideo
+                                       position:AVCaptureDevicePositionFront];
         AVCaptureDevice *cam = disc.devices.firstObject;
         if (!cam) { FU_LOG("startScanning: no front camera found"); [self finishSessionOnQueue]; return; }
 
         NSError *err = nil;
-        AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:cam error:&err];
+        AVCaptureDeviceInput *input =
+            [(id)FUAV(@"AVCaptureDeviceInput") deviceInputWithDevice:cam error:&err];
         if (!input) {
             FU_LOG("startScanning: camera input error: %@", err.localizedDescription ?: @"?");
             [self finishSessionOnQueue];
             return;
         }
 
-        AVCaptureSession *session = [AVCaptureSession new];
+        AVCaptureSession *session = [(id)FUAV(@"AVCaptureSession") new];
         session.sessionPreset = AVCaptureSessionPreset640x480;
         if (![session canAddInput:input]) { FU_LOG("startScanning: cannot add camera input"); [self finishSessionOnQueue]; return; }
         [session addInput:input];
 
-        AVCaptureVideoDataOutput *out = [AVCaptureVideoDataOutput new];
+        AVCaptureVideoDataOutput *out = [(id)FUAV(@"AVCaptureVideoDataOutput") new];
         out.alwaysDiscardsLateVideoFrames = YES;
         out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
         [out setSampleBufferDelegate:self queue:_captureQueue];
@@ -392,6 +465,7 @@ static float FUPrefFloat(NSString *key, float def) {
 #pragma mark - state transitions
 - (void)lockScreenDidAppear {
     self.deviceLocked = YES;
+    if (FUKillSwitchEngaged()) return;
     if (!self.enabled) return;
     if (!_setUpDone) [self setUp];
     [self startScanning];
@@ -399,6 +473,7 @@ static float FUPrefFloat(NSString *key, float def) {
 
 - (void)noteDeviceLocked {
     self.deviceLocked = YES;
+    if (FUKillSwitchEngaged()) return;
     if (!self.enabled) return;
     if (!_setUpDone) [self setUp];
     [self startScanning];
@@ -417,6 +492,7 @@ static inline FaceUnlockManager *FUMgr(void) { return [FaceUnlockManager sharedM
     %orig;
     @autoreleasepool {
         @try {
+            if (FUKillSwitchEngaged()) return;
             FUMgr().dashBoardVC = self;
             [FUMgr() lockScreenDidAppear];
         } @catch (NSException *ex) {
@@ -444,17 +520,10 @@ static inline FaceUnlockManager *FUMgr(void) { return [FaceUnlockManager sharedM
 
 %end
 
-// Load-time rule: NOTHING SpringBoard-related may run here. Tweaks are injected
-// at dyld time, before SpringBoard is initialized — even +sharedInstance on a
-// SpringBoard singleton crashes the process (Safe Mode). setUp() is deferred to
-// the first lock-screen appearance.
+// Load-time rule: NOTHING but a single log line may run here. Tweaks are
+// injected at dyld time, before SpringBoard is initialized — even
+// +sharedInstance on a SpringBoard singleton crashes the process (Safe Mode),
+// and notify_register_dispatch is deferred to setUp() for the same reason.
 %ctor {
-    @autoreleasepool {
-        FU_LOG("ctor: injecting into %@", [[NSBundle mainBundle] bundleIdentifier] ?: @"?");
-        // hot-reload templates when FaceUnlockSettings changes enrollment
-        notify_register_dispatch(kTemplatesChangedNotify.UTF8String, NULL,
-                                 dispatch_get_main_queue(), ^(int token) {
-            [[FaceUnlockManager sharedManager] reloadTemplates];
-        });
-    }
+    FU_LOG("ctor: FaceUnlock loaded (dyld time, no SpringBoard API touched)");
 }
