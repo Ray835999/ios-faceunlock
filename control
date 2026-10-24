@@ -1,0 +1,9 @@
+Package: com.ray835999.faceunlock
+Name: FaceUnlock
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Camera-based face unlock for Touch ID devices (iOS 15 rootless).
+Depends: mobilesubstrate
+Maintainer: Ray835999
+Author: Ray835999
+Section: Tweaks
