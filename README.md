@@ -32,12 +32,13 @@ Vizage（foxfortmobile，$3.99）是唯一在维护的同类商业插件；本�
 
 ## 安装
 
-1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_1.1.0-1+debug_iphoneos-arm64.deb`。
+1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_1.2.0-1+debug_iphoneos-arm64.deb`。
 2. 传到手机（Filza/SSH），Sileo/Zebra 安装或 `dpkg -i`（rootless 环境自动装到 `/var/jb`）。
-3. `ldrestart`（或 respring）——桌面出现 **FaceUnlock** 图标。
-4. **必须先设锁屏密码**（和 Vizage 一样的要求）。
+   安装脚本会自动跑 `uicache`，桌面出现 **FaceUnlock** 图标
+   （若图标没出现，手动执行 `uicache` 或 `ldrestart`）。
+3. **必须先设锁屏密码**（和 Vizage 一样的要求）。
 
-## 使用（ empirical 验证流程 ）
+## 使用（empirical 验证流程）
 
 1. 打开桌面的 **FaceUnlock** App →「开始录入人脸」→ 允许相机权限 →
    正脸对摄像头、缓慢转头，采满 5 个样本（进度 5/5 自动保存）。
@@ -58,33 +59,53 @@ Vizage（foxfortmobile，$3.99）是唯一在维护的同类商业插件；本�
 - 想录第二个人的脸：App 里先「清除」，再让对方录 5 次即可。
 - 每次扫描会话结束会打印 `scan session best distance=...`，这是调 Threshold 的依据。
 
-## 如果进 Safe Mode / SpringBoard 崩溃
+## 如果进 Safe Mode / SpringBoard 崩溃（v1.2.0 排查 SOP）
 
-1. **卸载**：Safe Mode 里能开 Sileo/Zebra，直接移除 FaceUnlock；或 SSH 进手机
+按日志三阶段定位（**按顺序看，能直接指出崩在哪一层**）：
+
+```bash
+log stream --predicate 'process == "SpringBoard"' | grep FaceUnlock
+```
+
+| 日志停在哪 | 含义 | 处理 |
+|---|---|---|
+| **完全没有 `ctor:`** | dyld 加载期就死了（框架链接/链接器层面） | v1.2.0 起 Vision/AVFoundation 已改**弱链接**，正常不应再出现；若仍出现，请把手机「设置 → 隐私 → 分析与改进 → 分析数据 → `SpringBoard-*.ips`」里最新一条崩溃报告发来 |
+| 有 `ctor:` 没有 `loaded:` | 首次锁屏 `setUp` 阶段崩 | 看崩溃报告 |
+| 有 `loaded:` 没有 `scanning started` | 摄像头会话启动阶段崩 | 日志里会先打印 `camera authorization status:`，把它一起发来 |
+| 有 `scanning started` 后崩 | 帧处理/解锁链路崩 | 看最后一条日志 |
+
+1. **不进 Safe Mode 的软关闭**：写 `{"Enabled": false}` 到 prefs plist 后 `ldrestart`；
+   或建急停文件 `/var/jb/var/mobile/Library/FaceUnlock/DISABLED`（存在即完全停用，
+   连 hook 内部逻辑都不跑）。
+2. **卸载**：Safe Mode 里能开 Sileo/Zebra，直接移除 FaceUnlock；或 SSH 进手机
    `dpkg -r com.ray835999.faceunlock && ldrestart`。
-2. **看注入点**：`log stream --predicate 'process == "SpringBoard"' | grep FaceUnlock`
-   - 连 `ctor: injecting into com.apple.springboard` 都没有 → 加载期就崩了
-     （substrate / dyld 层面，与业务代码无关）
-   - 有 `ctor:` 但没有 `loaded:` → setUp 阶段崩
-   - 有 `loaded:` 没有 `scanning started` → 摄像头会话阶段崩
-   - 有 `scanning started` 之后崩 → 看最后一条日志停在哪个阶段
-3. **软关闭**：在 App 里关「启用 FaceUnlock」开关，或写
-   `{"Enabled": false}` 到 prefs plist，然后 `ldrestart`。
+3. **隔离 App 侧**（判断是不是 App 引起的）：
+   `rm -rf /var/jb/Applications/FaceUnlockSettings.app && uicache && ldrestart`
+   —— 不崩就说明是 App 侧问题；崩则是插件侧。
 
-崩溃加固要点（v1.0.0 曾进 Safe Mode，已修）：
+v1.2.0 崩溃加固（v1.0.x 两次 Safe Mode 的根因都已覆盖）：
 
-- `%ctor` 不碰任何 SpringBoard 单例（tweak 在 dyld 加载期注入，那时 SpringBoard
-  还没初始化）；`setUp` 推迟到首次锁屏出现。
+- **`%ctor` 只打一行日志**，不注册通知、不碰任何 API（v1.0.0 的根因是
+  `%ctor` 里调 `SBLockScreenManager sharedInstance`；v1.1.1 起
+  `notify_register_dispatch` 也挪到了 `setUp`）。
+- **Vision / AVFoundation 改为弱链接**（`-weak_framework`）+ 所有类走
+  `NSClassFromString`、所有 extern 常量做 NULL 检查：框架在 SpringBoard 里
+  加载失败时只打一行日志并禁用功能，**不会**像硬链接那样让 dyld 直接杀掉进程。
 - 所有 hook body 与采集管线包 `@try/@catch`。
 - 回退匹配器不用 UIKit 后台绘图，纯 CoreImage。
 - `AVCaptureSession` 生命周期归采集队列，主线程只翻 BOOL 闸门 + 会话代际。
 - 模板数组跨线程访问全部加锁；不写 `NSNull` 进 plist。
+- 解锁调用前带 FastUnlockX 同款 `hasContent` 保护。
 
 ## 已知限制
 
-- 解锁的是锁屏 UI 层；SEP/密钥袋状态不变（与 Appellancy/Vizage 同类 2D 方案相同性质）。
+- 解锁的是锁屏 UI 层；SEP/钥匙串状态不变（与 Appellancy/Vizage 同类 2D 方案相同性质）。
 - 暗光下前置摄像头画质差，识别率下降；质量分低的帧会被丢弃。
 - 扫描窗口 12 秒无匹配自动停（省电），下次亮屏重新开始。
+- 插件在 SpringBoard 进程里跑摄像头，若日志显示
+  `camera authorization status: 0`（notDetermined）且始终拿不到帧，
+  说明该进程没有相机 TCC 授权——那是体系限制，需要改成「App 侧匹配 +
+  通知驱动解锁」架构（v1.3.0 候选方案）。
 
 ## 构建
 
@@ -99,10 +120,14 @@ make package THEOS_PACKAGE_SCHEME=rootless
 工程结构：
 
 ```
-Tweak.xm                      # SpringBoard 插件：匹配 + 解锁
+Tweak.xm                      # SpringBoard 插件：匹配 + 解锁（弱链接 Vision/AVFoundation）
 FacePrint.h/.m                # 共享管线：检测 / 特征指纹 / 模板读写 / 距离
 settings/main.m               # App 入口
 settings/FaceUnlockSettings.m # App UI：菜单 + 录入界面
-settings/Info.plist           # 相机权限 / SceneManifest / 图标（after-stage 覆盖）
+settings/FaceUnlockSettings.h # App 类声明
+settings/Info.plist           # 相机权限 / 图标（after-stage 覆盖 theos 自动生成的）
 settings/AppIcon60x60@2x.png  # 120x120 图标
+layout/DEBIAN/postinst        # 安装后 uicache，让桌面出现 App 图标
+Makefile                      # tweak（WEAK_FRAMEWORKS）+ application 两个 target
+control                       # deb 元数据
 ```
