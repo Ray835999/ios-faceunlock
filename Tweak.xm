@@ -2,19 +2,35 @@
 //  FaceUnlock — camera-based face unlock for Touch ID devices
 //  Target: iPhone 6s / iOS 15.8.x / rootless palera1n (Dopamine)
 //
-//  Design (all private API access is runtime-guarded):
-//   1. On lock screen (SBDashBoardViewController viewDidAppear) start the front
-//      camera and run Vision face detection + feature print per frame (~3 fps).
-//   2. Enrollment: the first N real unlocks (passcode / Touch ID) capture your
-//      faceprints. No companion app needed.
+//  Design (all private API access is runtime-guarded; nothing SpringBoard-
+//  related runs at load time):
+//   1. Lock screen appears -> start the front camera and run Vision face
+//      detection + feature print per frame (~3 fps) for a bounded window.
+//   2. Enrollment: the first N lock/unlock events capture your faceprints.
+//      No companion app needed.
 //   3. Match: min distance vs stored prints < threshold for 2 consecutive
 //      frames -> setAuthenticated:YES then
 //      SBLockScreenManager lockScreenViewControllerRequestsUnlock
 //      (the same unlock-completion call FastUnlockX uses).
 //
+//  Crash-safety rules (Safe Mode post-mortem):
+//   - %ctor must NOT touch SpringBoard singletons. Tweaks are loaded at dyld
+//     time, before SpringBoard is initialized; +[SBLockScreenManager
+//     sharedInstance] there is a guaranteed crash. setUp() is deferred to the
+//     first lock-screen appearance (main thread, SpringBoard fully up).
+//   - Every hook body and the entire capture pipeline is wrapped in
+//     @try/@catch: an NSException escaping into SpringBoard is a crash.
+//   - UIKit is never touched off the main thread — the fallback normaliser is
+//     CoreImage-only (CIImage + VNImageRequestHandler initWithCIImage:).
+//   - AVCaptureSession is owned by the capture queue; the main thread only
+//     flips BOOL gates. A session generation counter prevents a stale
+//     teardown from clearing a freshly started session's gates.
+//   - Templates are mutated on the capture queue and read on the main thread,
+//     so every access is @synchronized.
+//
 //  Verified against iPhoneOS15.6.sdk headers:
 //   - VNFeaturePrintObservation computeDistance:toFeaturePrintObservation:error:
-//   - VNObservation : NSSecureCoding  (prints are archivable)
+//   - VNObservation : NSSecureCoding (prints are archivable)
 //   - VNGenerateFaceFeaturePrintRequest is PRIVATE (not in the public SDK) ->
 //     used via NSClassFromString, with a public crop + VNGenerateImageFeaturePrintRequest
 //     fallback so the tweak still works if the private class disappears.
@@ -36,11 +52,13 @@ static NSString *const kPrefsAppID   = @"com.ray835999.faceunlock";
 static NSString *const kTemplateDir  = @"/var/jb/var/mobile/Library/FaceUnlock";
 static NSString *const kTemplateFile = @"/var/jb/var/mobile/Library/FaceUnlock/templates.plist";
 
-static const NSTimeInterval kScanWindow        = 12.0;  // auto-stop without a match
-static const NSTimeInterval kEnrollWindow      = 6.0;   // enrollment capture window
-static const NSTimeInterval kAnalysisInterval  = 0.35;  // ~3 fps
-static const NSTimeInterval kLogInterval       = 2.0;
+static const NSTimeInterval kScanWindow         = 12.0;  // auto-stop without a match
+static const NSTimeInterval kEnrollWindow       = 8.0;   // enrollment capture window
+static const NSTimeInterval kAnalysisInterval   = 0.35;  // ~3 fps
+static const NSTimeInterval kEnrollCooldown     = 1.5;   // min gap between samples
+static const NSTimeInterval kLogInterval        = 2.0;
 static const NSUInteger    kRequiredConsecutive = 2;
+static const CGFloat       kNormalizeSize       = 256.0;
 
 // ---------------------------------------------------------------------------
 // prefs (plist at /var/jb/var/mobile/Library/Preferences/<appid>.plist)
@@ -99,16 +117,28 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
 @end
 
 @implementation FaceUnlockManager {
+    // main-thread state
+    BOOL               _sessionActive;   // a scan session is armed
+    BOOL               _analyzing;       // frames are being processed (gate)
+    NSUInteger         _sessionGen;      // generation of the armed session
+
+    // capture-queue-only state
+    dispatch_queue_t   _captureQueue;
     AVCaptureSession  *_session;
-    NSMutableArray    *_templates;   // @{ @"arch":NSData, @"vec":NSData, @"n":uint, @"t":uint }
+    NSUInteger         _runningGen;      // generation of the live session
+    NSMutableArray    *_templates;       // @{ @"arch":NSData, @"vec":NSData, @"n":uint, @"t":uint }
     NSDate            *_lastAnalysis;
     NSDate            *_scanDeadline;
+    NSDate            *_lastEnroll;
     NSTimeInterval     _lastLog;
     NSUInteger         _consecutive;
     BOOL               _enrollRequested;
-    BOOL               _analyzing;
-    BOOL               _setUpDone;
     float              _sessionBest;
+
+    // shared state
+    id                 _templatesLock;
+    BOOL               _setUpDone;
+    BOOL               _passcodeSet;
 }
 
 + (instancetype)sharedManager {
@@ -118,20 +148,34 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
     return m;
 }
 
+- (instancetype)init {
+    if ((self = [super init])) {
+        _captureQueue = dispatch_queue_create("com.ray835999.faceunlock.capture", DISPATCH_QUEUE_SERIAL);
+        _templates    = [NSMutableArray array];
+        _templatesLock = [NSObject new];
+        _passcodeSet  = YES;
+    }
+    return self;
+}
+
+// Deferred from %ctor on purpose: this touches SpringBoard singletons and is
+// only safe once SpringBoard is fully initialized (first lock-screen appear).
 - (void)setUp {
     if (_setUpDone) return;
     _setUpDone = YES;
-    _templates = [NSMutableArray array];
     [self loadTemplates];
-    Class fp = NSClassFromString(@"VNGenerateFaceFeaturePrintRequest");
     BOOL passcode = YES;
     id lockMgr = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
     if (lockMgr && [lockMgr respondsToSelector:@selector(isPasscodeSet)]) {
         passcode = ((BOOL (*)(id, SEL))objc_msgSend)(lockMgr, @selector(isPasscodeSet));
     }
+    _passcodeSet = passcode;
+    Class fp = NSClassFromString(@"VNGenerateFaceFeaturePrintRequest");
+    NSUInteger enrolled = 0;
+    @synchronized (_templatesLock) { enrolled = _templates.count; }
     FU_LOG("loaded: enabled=%d threshold=%.3f method=%ld enrolled=%lu passcodeSet=%d faceprintClass=%s",
            FUPrefBool(@"Enabled", YES), FUPrefFloat(@"Threshold", 0.5), (long)[self method],
-           (unsigned long)_templates.count, passcode, fp ? "yes" : "no->image-print fallback");
+           (unsigned long)enrolled, passcode, fp ? "yes" : "no->image-print fallback");
     if (!FUPrefBool(@"Enabled", YES)) FU_LOG("tweak disabled via prefs (Enabled=NO)");
     if (!passcode) FU_LOG("no lock screen passcode set - face unlock needs a passcode (same as Vizage)");
 }
@@ -155,13 +199,16 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
 
 #pragma mark - templates
 - (void)loadTemplates {
-    [_templates removeAllObjects];
-    NSDictionary *root = [NSDictionary dictionaryWithContentsOfFile:kTemplateFile];
-    NSArray *arr = root[@"templates"];
-    if ([arr isKindOfClass:[NSArray class]]) {
-        for (NSDictionary *d in arr) {
-            if ([d isKindOfClass:[NSDictionary class]] && [d[@"vec"] isKindOfClass:[NSData class]]) {
-                [_templates addObject:d];
+    @synchronized (_templatesLock) {
+        [_templates removeAllObjects];
+        NSDictionary *root = [NSDictionary dictionaryWithContentsOfFile:kTemplateFile];
+        NSArray *arr = root[@"templates"];
+        if ([arr isKindOfClass:[NSArray class]]) {
+            for (NSDictionary *d in arr) {
+                if (![d isKindOfClass:[NSDictionary class]]) continue;
+                BOOL hasVec  = [d[@"vec"]  isKindOfClass:[NSData class]] && [(NSData *)d[@"vec"] length] > 0;
+                BOOL hasArch = [d[@"arch"] isKindOfClass:[NSData class]] && [(NSData *)d[@"arch"] length] > 0;
+                if (hasVec || hasArch) [_templates addObject:d];
             }
         }
     }
@@ -169,126 +216,184 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
 
 - (void)saveTemplates {
     @try {
+        NSArray *snapshot = nil;
+        @synchronized (_templatesLock) { snapshot = [_templates copy]; }
         [[NSFileManager defaultManager] createDirectoryAtPath:kTemplateDir
                                   withIntermediateDirectories:YES attributes:nil error:nil];
-        [@{ @"version": @1, @"templates": _templates } writeToFile:kTemplateFile atomically:YES];
-        FU_LOG("saved %lu template(s) -> %@", (unsigned long)_templates.count, kTemplateFile);
+        BOOL ok = [@{ @"version": @1, @"templates": snapshot } writeToFile:kTemplateFile atomically:YES];
+        FU_LOG("saved %lu template(s)%s", (unsigned long)snapshot.count, ok ? "" : " (write failed)");
     } @catch (NSException *e) {
         FU_LOG("saveTemplates failed: %@", e.reason);
     }
 }
 
-#pragma mark - capture
+#pragma mark - scan session lifecycle
+// main thread: arm/disarm gates only; the session itself lives on _captureQueue
 - (void)startScanning {
-    if (_session) return;
+    if (_sessionActive) return;
     if (!self.enabled) { FU_LOG("startScanning: disabled by prefs"); return; }
-    if (_templates.count == 0 && !_enrollRequested) {
-        FU_LOG("startScanning: no faceprints yet (unlock once with your passcode to enroll)");
-        return;
-    }
+    if (!_passcodeSet) return;   // nothing to unlock without a passcode
 
-    AVCaptureDeviceDiscoverySession *disc =
-        [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
-                                                              mediaType:AVMediaTypeVideo
-                                                               position:AVCaptureDevicePositionFront];
-    AVCaptureDevice *cam = disc.devices.firstObject;
-    if (!cam) { FU_LOG("startScanning: no front camera found"); return; }
+    NSUInteger enrolled = 0;
+    @synchronized (_templatesLock) { enrolled = _templates.count; }
+    BOOL enroll = (enrolled < self.enrollTarget);
 
-    NSError *err = nil;
-    AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:cam error:&err];
-    if (!input) { FU_LOG("startScanning: camera input error: %@", err.localizedDescription ?: @"?"); return; }
-
-    AVCaptureSession *session = [AVCaptureSession new];
-    session.sessionPreset = AVCaptureSessionPreset640x480;
-    if (![session canAddInput:input]) { FU_LOG("startScanning: cannot add camera input"); return; }
-    [session addInput:input];
-
-    AVCaptureVideoDataOutput *out = [AVCaptureVideoDataOutput new];
-    out.alwaysDiscardsLateVideoFrames = YES;
-    out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
-    dispatch_queue_t q = dispatch_queue_create("com.ray835999.faceunlock.capture", DISPATCH_QUEUE_SERIAL);
-    [out setSampleBufferDelegate:self queue:q];
-    if (![session canAddOutput:out]) { FU_LOG("startScanning: cannot add video output"); return; }
-    [session addOutput:out];
-    AVCaptureConnection *conn = [out connectionWithMediaType:AVMediaTypeVideo];
-    if (conn.supportsVideoOrientation) conn.videoOrientation = AVCaptureVideoOrientationPortrait;
-
-    _consecutive   = 0;
-    _sessionBest   = INFINITY;
-    _scanDeadline  = [NSDate dateWithTimeIntervalSinceNow:_enrollRequested ? kEnrollWindow : kScanWindow];
+    _sessionGen++;
+    _sessionActive = YES;
     _analyzing     = YES;
-    _session       = session;
-    [session startRunning];
-    FU_LOG("scanning started (%@ mode, enroll target=%lu)", _enrollRequested ? @"ENROLL" : @"MATCH",
-           (unsigned long)self.enrollTarget);
+    _enrollRequested = enroll;
+    NSUInteger gen = _sessionGen;
+    dispatch_async(_captureQueue, ^{
+        @autoreleasepool { [self setupAndRunSessionEnroll:enroll gen:gen]; }
+    });
 }
 
+// any thread: flip the frame gate now, tear the session down on its own queue
 - (void)stopScanning {
     _analyzing = NO;
+    if (!_sessionActive) return;
+    _sessionActive = NO;
+    dispatch_async(_captureQueue, ^{
+        @autoreleasepool { [self finishSessionOnQueue]; }
+    });
+}
+
+// capture queue only: create + start the session (or log why we cannot)
+- (void)setupAndRunSessionEnroll:(BOOL)enroll gen:(NSUInteger)gen {
+    @try {
+        AVCaptureDeviceDiscoverySession *disc =
+            [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+                                                                  mediaType:AVMediaTypeVideo
+                                                                   position:AVCaptureDevicePositionFront];
+        AVCaptureDevice *cam = disc.devices.firstObject;
+        if (!cam) { FU_LOG("startScanning: no front camera found"); [self finishSessionOnQueue]; return; }
+
+        NSError *err = nil;
+        AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:cam error:&err];
+        if (!input) {
+            FU_LOG("startScanning: camera input error: %@", err.localizedDescription ?: @"?");
+            [self finishSessionOnQueue];
+            return;
+        }
+
+        AVCaptureSession *session = [AVCaptureSession new];
+        session.sessionPreset = AVCaptureSessionPreset640x480;
+        if (![session canAddInput:input]) { FU_LOG("startScanning: cannot add camera input"); [self finishSessionOnQueue]; return; }
+        [session addInput:input];
+
+        AVCaptureVideoDataOutput *out = [AVCaptureVideoDataOutput new];
+        out.alwaysDiscardsLateVideoFrames = YES;
+        out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
+        [out setSampleBufferDelegate:self queue:_captureQueue];
+        if (![session canAddOutput:out]) { FU_LOG("startScanning: cannot add video output"); [self finishSessionOnQueue]; return; }
+        [session addOutput:out];
+        AVCaptureConnection *conn = [out connectionWithMediaType:AVMediaTypeVideo];
+        if (conn.supportsVideoOrientation) conn.videoOrientation = AVCaptureVideoOrientationPortrait;
+
+        NSUInteger enrolled = 0;
+        @synchronized (_templatesLock) { enrolled = _templates.count; }
+
+        _consecutive  = 0;
+        _sessionBest  = INFINITY;
+        _scanDeadline = [NSDate dateWithTimeIntervalSinceNow:enroll ? kEnrollWindow : kScanWindow];
+        _runningGen   = gen;
+        _session      = session;
+        [session startRunning];
+        FU_LOG("scanning started (%@ mode, enrolled=%lu target=%lu)", enroll ? @"ENROLL" : @"MATCH",
+               (unsigned long)enrolled, (unsigned long)self.enrollTarget);
+    } @catch (NSException *ex) {
+        FU_LOG("session setup exception: %@", ex.reason);
+        [self finishSessionOnQueue];
+    }
+}
+
+// capture queue only: stop + drop the live session, then clear the main-thread
+// gates — but only if the session we just tore down is still the armed one.
+- (void)finishSessionOnQueue {
     if (_sessionBest != INFINITY) {
-        [self throttledLog:[NSString stringWithFormat:@"scan session best distance=%.3f (threshold=%.3f)",
-                            _sessionBest, self.threshold]];
+        FU_LOG("scan session best distance=%.3f (threshold=%.3f)", _sessionBest, self.threshold);
         _sessionBest = INFINITY;
     }
-    if (!_session) return;
-    [_session stopRunning];
-    _session = nil;
+    BOOL hadSession = (_session != nil);
+    if (hadSession) {
+        [_session stopRunning];
+        _session = nil;
+    }
+    NSUInteger gen = _runningGen;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_sessionGen == gen) {
+            self->_sessionActive = NO;
+            self->_analyzing     = NO;
+        }
+    });
 }
 
 #pragma mark - AVCaptureVideoDataOutputSampleBufferDelegate
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
       fromConnection:(AVCaptureConnection *)connection {
     @autoreleasepool {
-        if (!_analyzing || !_session) return;
-        NSDate *now = [NSDate date];
-        if (_lastAnalysis && [now timeIntervalSinceDate:_lastAnalysis] < kAnalysisInterval) return;
-        _lastAnalysis = now;
-        if ([now timeIntervalSinceDate:_scanDeadline] > 0) {
-            BOOL wasEnrolling = _enrollRequested;
-            [self stopScanning];
-            if (wasEnrolling) { _enrollRequested = NO; FU_LOG("enrollment window expired - try again next unlock"); }
-            return;
-        }
-
-        CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
-        if (!pb) return;
-
-        VNDetectFaceRectanglesRequest     *rectReq = [VNDetectFaceRectanglesRequest new];
-        VNDetectFaceCaptureQualityRequest *qualReq = [VNDetectFaceCaptureQualityRequest new];
-        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
-        NSError *err = nil;
-        if (![handler performRequests:@[rectReq, qualReq] error:&err]) {
-            [self throttledLog:[NSString stringWithFormat:@"vision detect failed: %@",
-                                err.localizedDescription ?: @"?"]];
-            return;
-        }
-        VNFaceObservation *face = rectReq.results.firstObject;
-        if (![face isKindOfClass:[VNFaceObservation class]]) return;
-        if (face.faceCaptureQuality && [face.faceCaptureQuality floatValue] < 0.1) return; // dark / blurry
-
-        VNFeaturePrintObservation *print = [self printForFace:face handler:handler pixelBuffer:pb];
-        if (!print) return;
-
-        if (_enrollRequested) { [self enrollPrint:print]; return; }
-        if (_templates.count == 0) return;
-
-        float best = INFINITY;
-        for (NSDictionary *rec in _templates) {
-            float d = [self distanceRecord:rec toPrint:print];
-            if (d < best) best = d;
-        }
-        if (best == INFINITY) return;
-        if (best < _sessionBest) _sessionBest = best;
-        [self throttledLog:[NSString stringWithFormat:@"distance=%.3f threshold=%.3f", best, self.threshold]];
-
-        if (best < self.threshold) {
-            _consecutive++;
-            if (_consecutive >= kRequiredConsecutive) {
-                _consecutive = 0;
-                [self requestFaceUnlock:best];
+        @try {
+            if (!_analyzing || !_session) return;
+            NSDate *now = [NSDate date];
+            if (_lastAnalysis && [now timeIntervalSinceDate:_lastAnalysis] < kAnalysisInterval) return;
+            _lastAnalysis = now;
+            if ([now timeIntervalSinceDate:_scanDeadline] > 0) {
+                BOOL wasEnrolling = _enrollRequested;
+                [self stopScanning];
+                if (wasEnrolling) { _enrollRequested = NO; FU_LOG("enrollment window expired - try again next lock/unlock"); }
+                return;
             }
-        } else {
-            _consecutive = 0;
+
+            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
+            if (!pb) return;
+
+            VNDetectFaceRectanglesRequest     *rectReq = [VNDetectFaceRectanglesRequest new];
+            VNDetectFaceCaptureQualityRequest *qualReq = [VNDetectFaceCaptureQualityRequest new];
+            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
+            NSError *err = nil;
+            if (![handler performRequests:@[rectReq, qualReq] error:&err]) {
+                [self throttledLog:[NSString stringWithFormat:@"vision detect failed: %@",
+                                    err.localizedDescription ?: @"?"]];
+                return;
+            }
+            VNFaceObservation *face = rectReq.results.firstObject;
+            if (![face isKindOfClass:[VNFaceObservation class]]) return;
+            if (face.faceCaptureQuality && [face.faceCaptureQuality floatValue] < 0.1) return; // dark / blurry
+
+            VNFeaturePrintObservation *print = [self printForFace:face handler:handler pixelBuffer:pb];
+            if (!print) return;
+
+            if (_enrollRequested) { [self enrollPrint:print]; return; }
+
+            NSUInteger count = 0;
+            NSArray *snapshot = nil;
+            @synchronized (_templatesLock) {
+                count = _templates.count;
+                snapshot = [_templates copy];   // copy under the lock: the array
+            }                                    // is mutated on this same queue
+            if (count == 0) return;
+
+            float best = INFINITY;
+            for (NSDictionary *rec in snapshot) {
+                float d = [self distanceRecord:rec toPrint:print];
+                if (d < best) best = d;
+            }
+            if (best == INFINITY) return;
+            if (best < _sessionBest) _sessionBest = best;
+            [self throttledLog:[NSString stringWithFormat:@"distance=%.3f threshold=%.3f", best, self.threshold]];
+
+            if (best < self.threshold) {
+                _consecutive++;
+                if (_consecutive >= kRequiredConsecutive) {
+                    _consecutive = 0;
+                    [self requestFaceUnlock:best];
+                }
+            } else {
+                _consecutive = 0;
+            }
+        } @catch (NSException *ex) {
+            FU_LOG("capture exception: %@", ex.reason);
+            [self stopScanning];
         }
     }
 }
@@ -336,27 +441,34 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
     return [self imagePrintForFace:face pixelBuffer:pb];
 }
 
+// CoreImage-only on purpose: UIKit drawing is not thread-safe off the main
+// thread and is a guaranteed crash source inside a capture delegate queue.
 - (VNFeaturePrintObservation *)imagePrintForFace:(VNFaceObservation *)face pixelBuffer:(CVPixelBufferRef)pb {
     static BOOL logged = NO;
     @try {
         CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
         if (!ci) return nil;
-        CGSize sz = ci.extent.size;
-        if (sz.width < 1 || sz.height < 1) return nil;
+        CGRect ext = ci.extent;
+        if (ext.size.width < 1 || ext.size.height < 1) return nil;
         CGRect grow = CGRectInset(face.boundingBox, -0.15, -0.15);   // 15% margin, normalized box
         grow = CGRectIntersection(grow, CGRectMake(0, 0, 1, 1));
-        CGRect px = CGRectMake(grow.origin.x * sz.width, grow.origin.y * sz.height,
-                               grow.size.width * sz.width, grow.size.height * sz.height);
+        CGRect px = CGRectMake(ext.origin.x + grow.origin.x * ext.size.width,
+                               ext.origin.y + grow.origin.y * ext.size.height,
+                               grow.size.width  * ext.size.width,
+                               grow.size.height * ext.size.height);
+        if (px.size.width < 8 || px.size.height < 8) return nil;
         CIImage *cropped = [ci imageByCroppingToRect:px];
-        UIImage *ui = [UIImage imageWithCIImage:cropped];
-        UIGraphicsBeginImageContextWithOptions(CGSizeMake(256, 256), NO, 1.0);
-        [ui drawInRect:CGRectMake(0, 0, 256, 256)];
-        UIImage *norm = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-        if (!norm || !norm.CGImage) return nil;
+        if (!cropped) return nil;
+
+        // normalize to 256x256 in CoreImage space (no UIKit, thread-safe)
+        CGFloat sx = kNormalizeSize / px.size.width;
+        CGFloat sy = kNormalizeSize / px.size.height;
+        CGAffineTransform t = CGAffineTransformMakeScale(sx, sy);
+        t = CGAffineTransformTranslate(t, -px.origin.x * sx, -px.origin.y * sy);
+        CIImage *norm = [cropped imageByApplyingTransform:t];
 
         VNGenerateImageFeaturePrintRequest *req = [VNGenerateImageFeaturePrintRequest new];
-        VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:norm.CGImage options:@{}];
+        VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCIImage:norm ?: cropped options:@{}];
         NSError *e = nil;
         if ([h performRequests:@[req] error:&e]) {
             if (!logged) { logged = YES; FU_LOG("matcher: image feature print fallback (256px face crop)"); }
@@ -372,7 +484,7 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
 #pragma mark - distance
 - (float)distanceRecord:(NSDictionary *)rec toPrint:(VNFeaturePrintObservation *)print {
     NSData *arch = rec[@"arch"];
-    if ([arch isKindOfClass:[NSData class]]) {
+    if ([arch isKindOfClass:[NSData class]] && arch.length > 0) {
         @try {
             // allow the observation class and its private subclass (faceprints)
             NSMutableSet *classes = [NSMutableSet setWithObject:[VNFeaturePrintObservation class]];
@@ -409,22 +521,38 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
 
 #pragma mark - enrollment
 - (void)enrollPrint:(VNFeaturePrintObservation *)print {
+    // spread samples across the window instead of grabbing 5 identical frames
+    if (_lastEnroll && [[NSDate date] timeIntervalSinceDate:_lastEnroll] < kEnrollCooldown) return;
+    _lastEnroll = [NSDate date];
+
     NSData *arch = nil;
     @try {
         arch = [NSKeyedArchiver archivedDataWithRootObject:print requiringSecureCoding:NO error:nil];
     } @catch (NSException *e) { arch = nil; }
-    [_templates addObject:@{
-        @"arch": arch ?: [NSNull null],
-        @"vec":  print.data ?: [NSNull null],
+    NSData *vec = print.data ?: [NSData data];
+    if ((!arch || arch.length == 0) && vec.length == 0) {
+        FU_LOG("enroll: faceprint not serializable - skipping sample");
+        return;
+    }
+    // never store NSNull: it is not valid in a property list and would make
+    // the whole saveTemplates write throw
+    NSDictionary *rec = @{
+        @"arch": (arch && arch.length > 0) ? arch : [NSData data],
+        @"vec":  vec,
         @"n":    @(print.elementCount),
         @"t":    @(print.elementType),
         @"date": [NSDate date],
-    }];
+    };
+    NSUInteger count = 0;
+    @synchronized (_templatesLock) {
+        [_templates addObject:rec];
+        count = _templates.count;
+    }
     [self saveTemplates];
     FU_LOG("enrolled faceprint %lu/%lu (elements=%lu type=%ld)",
-           (unsigned long)_templates.count, (unsigned long)self.enrollTarget,
+           (unsigned long)count, (unsigned long)self.enrollTarget,
            (unsigned long)print.elementCount, (long)print.elementType);
-    if (_templates.count >= self.enrollTarget) {
+    if (count >= self.enrollTarget) {
         _enrollRequested = NO;
         [self stopScanning];
         FU_LOG("enrollment complete - lock the device and look at the camera to test");
@@ -438,59 +566,81 @@ static NSInteger FUPrefInt(NSString *key, NSInteger def) {
     [self stopScanning];
     FU_LOG("MATCH distance=%.3f - requesting unlock", distance);
     dispatch_async(dispatch_get_main_queue(), ^{
-        id vc = self.dashBoardVC;
-        BOOL called = NO;
-        if (vc && [vc respondsToSelector:@selector(setAuthenticated:)]) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(vc, @selector(setAuthenticated:), YES);
-            called = YES;
-        }
-        if (!called) FU_LOG("setAuthenticated: unavailable - using unlock-request fallback");
-        // safety net: if the hook never completes the unlock, force it shortly after
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (self.faceUnlockInProgress) {
-                FU_LOG("safety net: forcing unlock request");
+        @autoreleasepool {
+            id vc = self.dashBoardVC;
+            if (vc && [vc respondsToSelector:@selector(setAuthenticated:)]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(vc, @selector(setAuthenticated:), YES);
+            } else {
+                FU_LOG("setAuthenticated: unavailable - using unlock-request fallback");
                 [self completeFaceUnlock];
             }
-        });
+            // safety net: if the hook never completes the unlock, force it shortly after
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @autoreleasepool {
+                    if (self.faceUnlockInProgress) {
+                        FU_LOG("safety net: forcing unlock request");
+                        [self completeFaceUnlock];
+                    }
+                }
+            });
+        }
     });
 }
 
 // Mirrors FastUnlockX (CP Digital Darkroom, MIT): after authentication the lock
-// screen asks SBLockScreenManager to complete the unlock.
+// screen asks SBLockScreenManager to complete the unlock. Their tweak guards the
+// call with !hasContent on the combined list; we do the same via KVC.
 - (void)completeFaceUnlock {
+    self.faceUnlockInProgress = NO;
     id lockMgr = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
     SEL sel = @selector(lockScreenViewControllerRequestsUnlock);
-    if (lockMgr && [lockMgr respondsToSelector:sel]) {
-        ((void (*)(id, SEL))objc_msgSend)(lockMgr, sel);
-        FU_LOG("lockScreenViewControllerRequestsUnlock sent");
-    } else {
+    if (!lockMgr || ![lockMgr respondsToSelector:sel]) {
         FU_LOG("SBLockScreenManager / lockScreenViewControllerRequestsUnlock unavailable");
+        return;
     }
-    self.faceUnlockInProgress = NO;
+    BOOL hasContent = NO;
+    @try {
+        id vc   = self.dashBoardVC;
+        id page = [vc valueForKey:@"mainPageContentViewController"];
+        id list = [page valueForKey:@"combinedListViewController"];
+        NSNumber *hc = [list valueForKey:@"hasContent"];
+        hasContent = [hc isKindOfClass:[NSNumber class]] ? hc.boolValue : NO;
+    } @catch (NSException *ex) {
+        FU_LOG("hasContent probe failed: %@", ex.reason);
+    }
+    if (hasContent) {
+        FU_LOG("unlock request deferred: lock screen has notification content");
+        return;
+    }
+    ((void (*)(id, SEL))objc_msgSend)(lockMgr, sel);
+    FU_LOG("lockScreenViewControllerRequestsUnlock sent");
 }
 
 #pragma mark - state transitions
 - (void)lockScreenDidAppear {
     self.deviceLocked = YES;
-    if (self.enabled && _templates.count > 0) [self startScanning];
+    if (!self.enabled) return;
+    if (!_setUpDone) [self setUp];
+    [self startScanning];
 }
 
 - (void)noteDeviceLocked {
     self.deviceLocked = YES;
-    if (self.enabled && _templates.count > 0) [self startScanning];
+    if (!self.enabled) return;
+    if (!_setUpDone) [self setUp];
+    [self startScanning];
 }
 
 - (void)noteRealUnlock {
     // a real passcode / Touch ID unlock happened: the perfect enrollment moment
     self.deviceLocked = NO;
     [self stopScanning];
-    if (self.enabled && _templates.count < self.enrollTarget) {
-        _enrollRequested = YES;
-        FU_LOG("enrollment: real unlock #%lu - capturing your faceprint",
-               (unsigned long)_templates.count + 1);
-        [self startScanning];
-    }
+    if (!self.enabled) return;
+    if (!_setUpDone) [self setUp];
+    NSUInteger count = 0;
+    @synchronized (_templatesLock) { count = _templates.count; }
+    if (count < self.enrollTarget) [self startScanning];   // enroll window
 }
 
 @end
@@ -504,26 +654,42 @@ static inline FaceUnlockManager *FUMgr(void) { return [FaceUnlockManager sharedM
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    FUMgr().dashBoardVC = self;
-    [FUMgr() lockScreenDidAppear];
+    @autoreleasepool {
+        @try {
+            FUMgr().dashBoardVC = self;
+            [FUMgr() lockScreenDidAppear];
+        } @catch (NSException *ex) {
+            FU_LOG("viewDidAppear hook exception: %@", ex.reason);
+        }
+    }
 }
 
 - (void)setAuthenticated:(BOOL)authenticated {
-    BOOL ours = FUMgr().faceUnlockInProgress;
-    %orig;
-    if (authenticated) {
-        if (ours) [FUMgr() completeFaceUnlock];   // finish the unlock we requested
-        else      [FUMgr() noteRealUnlock];       // real unlock -> enrollment opportunity
-    } else {
-        [FUMgr() noteDeviceLocked];
+    BOOL ours = NO;
+    @autoreleasepool {
+        @try {
+            ours = FUMgr().faceUnlockInProgress;
+            %orig;
+            if (authenticated) {
+                if (ours) [FUMgr() completeFaceUnlock];   // finish the unlock we requested
+                else      [FUMgr() noteRealUnlock];       // real unlock -> enrollment opportunity
+            } else {
+                [FUMgr() noteDeviceLocked];
+            }
+        } @catch (NSException *ex) {
+            FU_LOG("setAuthenticated hook exception: %@", ex.reason);
+        }
     }
 }
 
 %end
 
+// Load-time rule: NOTHING SpringBoard-related may run here. Tweaks are injected
+// at dyld time, before SpringBoard is initialized — even +sharedInstance on a
+// SpringBoard singleton crashes the process (Safe Mode). setUp() is deferred to
+// the first lock-screen appearance.
 %ctor {
     @autoreleasepool {
         FU_LOG("ctor: injecting into %@", [[NSBundle mainBundle] bundleIdentifier] ?: @"?");
-        [FUMgr() setUp];
     }
 }
