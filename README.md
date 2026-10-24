@@ -32,7 +32,7 @@ Vizage（foxfortmobile，$3.99）是唯一在维护的同类商业插件；本�
 
 ## 安装
 
-1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_1.2.0-1+debug_iphoneos-arm64.deb`。
+1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_1.2.1-1+debug_iphoneos-arm64.deb`。
 2. 传到手机（Filza/SSH），Sileo/Zebra 安装或 `dpkg -i`（rootless 环境自动装到 `/var/jb`）。
    安装脚本会自动跑 `uicache`，桌面出现 **FaceUnlock** 图标
    （若图标没出现，手动执行 `uicache` 或 `ldrestart`）。
@@ -69,8 +69,8 @@ log stream --predicate 'process == "SpringBoard"' | grep FaceUnlock
 
 | 日志停在哪 | 含义 | 处理 |
 |---|---|---|
-| **完全没有 `ctor:`** | dyld 加载期就死了（框架链接/链接器层面） | v1.2.0 起 Vision/AVFoundation 已改**弱链接**，正常不应再出现；若仍出现，请把手机「设置 → 隐私 → 分析与改进 → 分析数据 → `SpringBoard-*.ips`」里最新一条崩溃报告发来 |
-| 有 `ctor:` 没有 `loaded:` | 首次锁屏 `setUp` 阶段崩 | 看崩溃报告 |
+| **完全没有 `ctor:`** | dyld 加载期就死了（框架链接/链接器层面） | v1.2.1 起 Vision/AVFoundation/CoreMedia/CoreVideo 已改为**弱链接且不带任何加载命令**，加载期不可能再因框架而死；若仍出现，请把手机「设置 → 隐私 → 分析与改进 → 分析数据 → `SpringBoard-*.ips`」里最新一条崩溃报告发来 |
+| 有 `ctor:` 没有 `loaded:` | 首次锁屏 `setUp` 阶段崩 | 看 `dlopen CoreMedia/AVFoundation/Vision` 三行是否打印完——崩在哪个后面就是哪个框架的初始化问题 |
 | 有 `loaded:` 没有 `scanning started` | 摄像头会话启动阶段崩 | 日志里会先打印 `camera authorization status:`，把它一起发来 |
 | 有 `scanning started` 后崩 | 帧处理/解锁链路崩 | 看最后一条日志 |
 
@@ -86,16 +86,22 @@ log stream --predicate 'process == "SpringBoard"' | grep FaceUnlock
 v1.2.0 崩溃加固（v1.0.x 两次 Safe Mode 的根因都已覆盖）：
 
 - **`%ctor` 只打一行日志**，不注册通知、不碰任何 API（v1.0.0 的根因是
-  `%ctor` 里调 `SBLockScreenManager sharedInstance`；v1.1.1 起
+  `%ctor` 里调 `SBLockScreenManager sharedInstance`；v1.2.x 起
   `notify_register_dispatch` 也挪到了 `setUp`）。
-- **Vision / AVFoundation 改为弱链接**（`-weak_framework`）+ 所有类走
-  `NSClassFromString`、所有 extern 常量做 NULL 检查：框架在 SpringBoard 里
-  加载失败时只打一行日志并禁用功能，**不会**像硬链接那样让 dyld 直接杀掉进程。
+- **Vision / AVFoundation / CoreMedia / CoreVideo 弱链接且不带加载命令**：
+  编译产物里这些框架**没有任何 LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB**——
+  dyld 在把插件注入 SpringBoard 时不会去加载它们，加载期零风险；
+  运行时在 `setUp` 里 `dlopen`，失败只打日志并禁用功能。
+- 所有类引用走 `NSClassFromString`、所有 extern 常量做 NULL 检查
+  （`AVMediaTypeVideo`、`AVCaptureSessionPreset640x480`、
+  `kCVPixelBufferPixelFormatTypeKey` 等弱引用符号）。
 - 所有 hook body 与采集管线包 `@try/@catch`。
 - 回退匹配器不用 UIKit 后台绘图，纯 CoreImage。
 - `AVCaptureSession` 生命周期归采集队列，主线程只翻 BOOL 闸门 + 会话代际。
 - 模板数组跨线程访问全部加锁；不写 `NSNull` 进 plist。
 - 解锁调用前带 FastUnlockX 同款 `hasContent` 保护。
+- 安装后 `postinst` 自动 `uicache`；`layout/DEBIAN/postinst` 以 755 模式提交
+  （Contents API 不记录 mode，是用 Git Data API 补的 tree entry mode）。
 
 ## 已知限制
 
@@ -120,7 +126,7 @@ make package THEOS_PACKAGE_SCHEME=rootless
 工程结构：
 
 ```
-Tweak.xm                      # SpringBoard 插件：匹配 + 解锁（弱链接 Vision/AVFoundation）
+Tweak.xm                      # SpringBoard 插件：匹配 + 解锁（框架弱链接 + 运行时 dlopen）
 FacePrint.h/.m                # 共享管线：检测 / 特征指纹 / 模板读写 / 距离
 settings/main.m               # App 入口
 settings/FaceUnlockSettings.m # App UI：菜单 + 录入界面
