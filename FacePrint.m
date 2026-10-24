@@ -1,6 +1,10 @@
 //
 //  FacePrint.m — shared face feature-print pipeline (see FacePrint.h).
 //
+//  Every Vision class is resolved at runtime (NSClassFromString) so this file
+//  is safe to compile into a process where Vision is weak-linked and may fail
+//  to load (the SpringBoard tweak). Callers check +visionAvailable first.
+//
 
 #import "FacePrint.h"
 #import <CoreImage/CoreImage.h>
@@ -12,22 +16,48 @@ static NSString *const kTemplateFile = @"/var/jb/var/mobile/Library/FaceUnlock/t
 
 @implementation FacePrint
 
+#pragma mark - runtime class resolution
+
++ (Class)handlerClass   { return NSClassFromString(@"VNImageRequestHandler"); }
++ (Class)faceRectClass  { return NSClassFromString(@"VNDetectFaceRectanglesRequest"); }
++ (Class)faceQualClass  { return NSClassFromString(@"VNDetectFaceCaptureQualityRequest"); }
++ (Class)faceObsClass   { return NSClassFromString(@"VNFaceObservation"); }
++ (Class)imgPrintClass  { return NSClassFromString(@"VNGenerateImageFeaturePrintRequest"); }
++ (Class)printObsClass  { return NSClassFromString(@"VNFeaturePrintObservation"); }
++ (Class)facePrintClass { return NSClassFromString(@"VNGenerateFaceFeaturePrintRequest"); }
+
++ (BOOL)visionAvailable {
+    return (self.handlerClass != nil
+         && self.faceRectClass != nil
+         && self.faceQualClass != nil
+         && self.faceObsClass != nil
+         && self.imgPrintClass != nil
+         && self.printObsClass != nil);
+}
+
 #pragma mark - detection
 + (VNFaceObservation *)detectFaceInPixelBuffer:(CVPixelBufferRef)pixelBuffer
                                    qualityGate:(BOOL)qualityGate {
+    if (![self visionAvailable]) return nil;
     @try {
-        VNDetectFaceRectanglesRequest     *rectReq = [VNDetectFaceRectanglesRequest new];
-        VNDetectFaceCaptureQualityRequest *qualReq = [VNDetectFaceCaptureQualityRequest new];
-        VNImageRequestHandler *handler =
-            [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBuffer options:@{}];
+        id rectReq = [self.faceRectClass new];
+        id qualReq = [self.faceQualClass new];
+        if (!rectReq || !qualReq) return nil;
+        id<FUVNRequestHandler> handler =
+            [[self.handlerClass alloc] initWithCVPixelBuffer:pixelBuffer options:@{}];
+        if (!handler) return nil;
         NSError *err = nil;
         if (![handler performRequests:@[rectReq, qualReq] error:&err]) return nil;
-        VNFaceObservation *face = rectReq.results.firstObject;
-        if (![face isKindOfClass:[VNFaceObservation class]]) return nil;
-        if (qualityGate && face.faceCaptureQuality && [face.faceCaptureQuality floatValue] < 0.1) {
-            return nil; // dark / blurry
+        id results = [rectReq valueForKey:@"results"];
+        id face = [results isKindOfClass:[NSArray class]] ? [results firstObject] : nil;
+        if (![face isKindOfClass:self.faceObsClass]) return nil;
+        if (qualityGate) {
+            NSNumber *q = [face valueForKey:@"faceCaptureQuality"];
+            if (q && [q isKindOfClass:[NSNumber class]] && q.floatValue < 0.1) {
+                return nil; // dark / blurry
+            }
         }
-        return face;
+        return (VNFaceObservation *)face;
     } @catch (NSException *ex) {
         return nil;
     }
@@ -37,21 +67,24 @@ static NSString *const kTemplateFile = @"/var/jb/var/mobile/Library/FaceUnlock/t
 + (VNFeaturePrintObservation *)observationForFace:(VNFaceObservation *)face
                                       pixelBuffer:(CVPixelBufferRef)pixelBuffer
                                        logPrefix:(NSString *)logPrefix {
-    VNImageRequestHandler *handler =
-        [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBuffer options:@{}];
+    if (![self visionAvailable]) return nil;
+    @try {
+        id<FUVNRequestHandler> handler =
+            [[self.handlerClass alloc] initWithCVPixelBuffer:pixelBuffer options:@{}];
+        if (!handler) return nil;
 
-    // preferred: private VNGenerateFaceFeaturePrintRequest (Photos-grade embedding)
-    if (1) {
-        Class cls = NSClassFromString(@"VNGenerateFaceFeaturePrintRequest");
-        if (cls) {
-            id req = [cls new];
+        // preferred: private VNGenerateFaceFeaturePrintRequest (Photos-grade embedding)
+        Class fpCls = self.facePrintClass;
+        if (fpCls) {
+            id req = [fpCls new];
             if ([req respondsToSelector:NSSelectorFromString(@"setInputFaceObservations:")]) {
                 @try {
                     [req setValue:@[face] forKey:@"inputFaceObservations"];
                     NSError *e = nil;
                     if ([handler performRequests:@[req] error:&e]) {
-                        for (id obs in [req results]) {
-                            if ([obs isKindOfClass:[VNFeaturePrintObservation class]]) {
+                        id results = [req valueForKey:@"results"];
+                        for (id obs in results) {
+                            if ([obs isKindOfClass:self.printObsClass]) {
                                 static BOOL logged = NO;
                                 if (!logged) {
                                     logged = YES;
@@ -66,42 +99,45 @@ static NSString *const kTemplateFile = @"/var/jb/var/mobile/Library/FaceUnlock/t
                 }
             }
         }
-    }
 
-    // fallback: crop the face rect, normalize to 256px, public image print.
-    // CoreImage only — UIKit drawing is not thread-safe off the main thread.
-    @try {
-        CIImage *ci = [CIImage imageWithCVPixelBuffer:pixelBuffer];
-        if (!ci) return nil;
-        CGRect ext = ci.extent;
-        if (ext.size.width < 1 || ext.size.height < 1) return nil;
-        CGRect grow = CGRectInset(face.boundingBox, -0.15, -0.15);   // 15% margin
-        grow = CGRectIntersection(grow, CGRectMake(0, 0, 1, 1));
-        CGRect px = CGRectMake(ext.origin.x + grow.origin.x * ext.size.width,
-                               ext.origin.y + grow.origin.y * ext.size.height,
-                               grow.size.width  * ext.size.width,
-                               grow.size.height * ext.size.height);
-        if (px.size.width < 8 || px.size.height < 8) return nil;
-        CIImage *cropped = [ci imageByCroppingToRect:px];
-        if (!cropped) return nil;
+        // fallback: crop the face rect, normalize to 256px, public image print.
+        // CoreImage only — UIKit drawing is not thread-safe off the main thread.
+        @try {
+            CIImage *ci = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+            if (!ci) return nil;
+            CGRect ext = ci.extent;
+            if (ext.size.width < 1 || ext.size.height < 1) return nil;
+            CGRect grow = CGRectInset(face.boundingBox, -0.15, -0.15);   // 15% margin
+            grow = CGRectIntersection(grow, CGRectMake(0, 0, 1, 1));
+            CGRect px = CGRectMake(ext.origin.x + grow.origin.x * ext.size.width,
+                                   ext.origin.y + grow.origin.y * ext.size.height,
+                                   grow.size.width  * ext.size.width,
+                                   grow.size.height * ext.size.height);
+            if (px.size.width < 8 || px.size.height < 8) return nil;
+            CIImage *cropped = [ci imageByCroppingToRect:px];
+            if (!cropped) return nil;
 
-        CGFloat sx = 256.0 / px.size.width;
-        CGFloat sy = 256.0 / px.size.height;
-        CGAffineTransform t = CGAffineTransformMakeScale(sx, sy);
-        t = CGAffineTransformTranslate(t, -px.origin.x * sx, -px.origin.y * sy);
-        CIImage *norm = [cropped imageByApplyingTransform:t];
+            CGFloat sx = 256.0 / px.size.width;
+            CGFloat sy = 256.0 / px.size.height;
+            CGAffineTransform t = CGAffineTransformMakeScale(sx, sy);
+            t = CGAffineTransformTranslate(t, -px.origin.x * sx, -px.origin.y * sy);
+            CIImage *norm = [cropped imageByApplyingTransform:t];
 
-        VNGenerateImageFeaturePrintRequest *req = [VNGenerateImageFeaturePrintRequest new];
-        VNImageRequestHandler *h =
-            [[VNImageRequestHandler alloc] initWithCIImage:norm ?: cropped options:@{}];
-        NSError *e = nil;
-        if ([h performRequests:@[req] error:&e]) {
-            static BOOL logged = NO;
-            if (!logged) {
-                logged = YES;
-                NSLog(@"[FaceUnlock] %@ matcher: image feature print fallback (256px crop)", logPrefix);
+            id req = [self.imgPrintClass new];
+            id<FUVNRequestHandler> h =
+                [[self.handlerClass alloc] initWithCIImage:norm ?: cropped options:@{}];
+            NSError *e = nil;
+            if (h && [h performRequests:@[req] error:&e]) {
+                static BOOL logged = NO;
+                if (!logged) {
+                    logged = YES;
+                    NSLog(@"[FaceUnlock] %@ matcher: image feature print fallback (256px crop)", logPrefix);
+                }
+                id results = [req valueForKey:@"results"];
+                return (VNFeaturePrintObservation *)[results firstObject];
             }
-            return req.results.firstObject;
+        } @catch (NSException *ex) {
+            // give up on this frame
         }
     } @catch (NSException *ex) {
         // give up on this frame
@@ -176,15 +212,15 @@ static NSString *const kTemplateFile = @"/var/jb/var/mobile/Library/FaceUnlock/t
     if ([arch isKindOfClass:[NSData class]] && arch.length > 0) {
         @try {
             // allow the observation class and its private subclass (faceprints)
-            NSMutableSet *classes = [NSMutableSet setWithObject:[VNFeaturePrintObservation class]];
+            NSMutableSet *classes = [NSMutableSet setWithObject:self.printObsClass];
             Class fpObs = NSClassFromString(@"VNFaceFeaturePrintObservation");
             if (fpObs) [classes addObject:fpObs];
             NSError *uerr = nil;
             id tObs = [NSKeyedUnarchiver unarchivedObjectOfClasses:classes fromData:arch error:&uerr];
-            if ([tObs isKindOfClass:[VNFeaturePrintObservation class]]) {
+            if ([tObs conformsToProtocol:@protocol(FUVNFeaturePrintObservation)]) {
                 float d = 0;
                 NSError *e = nil;
-                if ([(VNFeaturePrintObservation *)tObs computeDistance:&d
+                if ([(id<FUVNFeaturePrintObservation>)tObs computeDistance:&d
                                             toFeaturePrintObservation:print error:&e]) return d;
             }
         } @catch (NSException *ex) {
