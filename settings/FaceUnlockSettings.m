@@ -201,16 +201,9 @@ static void FUSPostTemplatesChanged(void) {
             [hits appendFormat:@" p%d=%@", i, v ? NSStringFromClass([v class]) : @"nil"];
         }
 
-        // which window is key - without the deprecated keyWindow property
-        // (theos builds with -Werror and it is deprecated since iOS 13)
-        BOOL isKeyWin = NO;
-        for (UIWindow *win in app.windows) {
-            if (win.isKeyWindow) { isKeyWin = (win == w); break; }
-        }
-
-        FUDiagLog(@"snapshot: state=%ld isKeyWin=%d isKey=%d hidden=%d alpha=%.2f level=%ld bounds=%@ rootVC=%@ events=%lu hits=%@",
+        FUDiagLog(@"snapshot: state=%ld isKey=%d hidden=%d alpha=%.2f level=%ld bounds=%@ rootVC=%@ events=%lu hits=%@",
                   (long)app.applicationState,
-                  (int)isKeyWin,
+                  (int)w.isKeyWindow,
                   (int)w.isKeyWindow,
                   (int)w.hidden,
                   (double)w.alpha,
