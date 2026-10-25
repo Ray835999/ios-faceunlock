@@ -172,6 +172,11 @@ static void FUKillSwitchEngage(NSString *why) {
 
 // Returns YES when the tweak must stay completely inert this boot.
 // Writes DISABLED when it detects a crash loop caused by us.
+//
+// Discriminator: a real SpringBoard crash loop reloads this dylib every 2-5 s,
+// so 4 loads land inside a few seconds. A human doing manual resprings cannot
+// reach 4 loads in 40 s (each respring alone takes longer). Using 120 s here
+// would false-positive on "respring, look, respring again" testing.
 static BOOL FUBootGuard(void) {
     @try {
         NSString *p = FUPath(@"boot.plist");
@@ -179,15 +184,15 @@ static BOOL FUBootGuard(void) {
         NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
         double first = [d[@"first"] doubleValue];
         int count = [d[@"count"] intValue];
-        if (first <= 0 || (now - first) > 120.0) { first = now; count = 0; }
+        if (first <= 0 || (now - first) > 40.0) { first = now; count = 0; }
         count++;
         NSDictionary *out = @{ @"first": @(first), @"count": @(count), @"last": @(now) };
         [[NSFileManager defaultManager] createDirectoryAtPath:FU_DIR
                                  withIntermediateDirectories:YES attributes:nil error:nil];
         [out writeToFile:p atomically:YES];
         if (count >= 4) {
-            FUKillSwitchEngage(@"auto-disabled: tweak loaded 4 times within 120s (SpringBoard was crash-looping)\n"
-                               @"delete this file after fixing / or press 急停 in the app to re-enable");
+            FUKillSwitchEngage(@"auto-disabled: tweak loaded 4 times within 40s (SpringBoard was crash-looping)\n"
+                               @"delete this file / press 急停 then 重新启用 in the app to re-enable");
             return YES;
         }
         return NO;
@@ -426,9 +431,9 @@ static float FUPrefFloat(NSString *key, float def) {
 - (void)startScanning {
     if (_armed) return;
     @try {
-        FULoadFrameworksOnce();
-        if (!gAVOK)    { FUStatusSet(@"state", @"no AVFoundation"); return; }
-        if (!gVisionOK){ FUStatusSet(@"state", @"no Vision"); return; }
+        // NOTE: no dlopen / framework probing here. This runs on the main thread
+        // while the lock screen is animating in; loading Vision there costs a
+        // visible hitch. All of it happens on the capture queue instead.
         if (_passcodeSet == NO) {
             FUStatusSet(@"state", @"no passcode - nothing to unlock");
             FU_LOG(@"no passcode set; face unlock is pointless");
@@ -456,8 +461,11 @@ static float FUPrefFloat(NSString *key, float def) {
     dispatch_async(_q, ^{ @autoreleasepool { [self teardown]; } });
 }
 
-// capture queue only
+// capture queue only. Always clears _armed on the main thread (generation
+// guarded) — otherwise one camera failure would silently disable every later
+// lock for the rest of this SpringBoard session.
 - (void)teardown {
+    NSUInteger gen = _runGen;
     @try {
         if (_session) {
             [_session stopRunning];
@@ -467,12 +475,24 @@ static float FUPrefFloat(NSString *key, float def) {
         FU_LOG(@"teardown: %@", e.reason);
     }
     _deadline = nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_gen == gen) self->_armed = NO;
+    });
 }
 
 // capture queue only
 - (void)runSessionGen:(NSUInteger)gen {
     @autoreleasepool {
         @try {
+            _runGen = gen;
+            FULoadFrameworksOnce();
+            if (!gAVOK || !gVisionOK) {
+                FUStatusSet(@"state", gAVOK ? @"no Vision in SpringBoard"
+                                            : @"no AVFoundation in SpringBoard");
+                FU_LOG(@"frameworks unavailable - no scan this time");
+                [self teardown];      // not a camera failure: do not count it
+                return;
+            }
             // authorization state (informational; never call requestAccess here:
             // an alert on top of the lock screen is exactly how v1.x hung)
             @try {
@@ -524,7 +544,6 @@ static float FUPrefFloat(NSString *key, float def) {
             _best        = INFINITY;
             _lastAnalysis = nil;
             _deadline    = [NSDate dateWithTimeIntervalSinceNow:kScanWindow];
-            _runGen      = gen;
             _session     = session;
 
             [session startRunning];
