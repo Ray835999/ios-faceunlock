@@ -1,14 +1,24 @@
 #!/bin/sh
 # FaceUnlock postinst
 #
-# dpkg installs bypass installd, so the companion app's icon will not appear
-# on the home screen until uicache re-registers the app list. This is required
-# for FaceUnlockSettings to show up (and for Settings > FaceUnlock to exist).
-# Never fail the install because of this.
+# 1. dpkg installs bypass installd, so the companion app's icon will not appear
+#    on the home screen until uicache re-registers the app list. This is required
+#    for FaceUnlockSettings to show up (and for Settings > FaceUnlock to exist).
+# 2. Pre-create the app data dir owned by mobile. The app (running as mobile)
+#    creates it on demand anyway; doing it here with the right owner guarantees
+#    the diagnostic log and templates.plist are writable from the first launch.
+# 3. Arm the first-launch diagnostic popup (DEBUG_UI flag). The app deletes the
+#    flag when the user dismisses the alert, so it pops exactly once per install.
+# Never fail the install because of any of this.
 if [ -x /var/jb/usr/bin/uicache ]; then
     /var/jb/usr/bin/uicache 2>/dev/null || true
 elif command -v uicache >/dev/null 2>&1; then
     uicache 2>/dev/null || true
 fi
+
+APPDATA=/var/jb/var/mobile/Library/FaceUnlock
+mkdir -p "$APPDATA" 2>/dev/null || true
+chown mobile:mobile "$APPDATA" 2>/dev/null || true
+touch "$APPDATA/DEBUG_UI" 2>/dev/null || true
 
 exit 0
