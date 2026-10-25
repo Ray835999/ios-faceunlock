@@ -264,6 +264,7 @@ static const int           kMaxCameraFailures = 3;
 
     // capture queue
     dispatch_queue_t _q;
+    dispatch_queue_t _sq;    // session start/stop: never the sample-buffer queue
     AVCaptureSession *_session;
     NSUInteger       _runGen;
     NSDate          *_lastAnalysis;
@@ -294,6 +295,7 @@ static const int           kMaxCameraFailures = 3;
 - (instancetype)init {
     if ((self = [super init])) {
         _q        = dispatch_queue_create("com.ray835999.faceunlock.capture", DISPATCH_QUEUE_SERIAL);
+        _sq       = dispatch_queue_create("com.ray835999.faceunlock.session", DISPATCH_QUEUE_SERIAL);
         _tplLock  = [NSObject new];
         _templates = @[];
         _best     = INFINITY;
@@ -467,9 +469,15 @@ static float FUPrefFloat(NSString *key, float def) {
 - (void)teardown {
     NSUInteger gen = _runGen;
     @try {
-        if (_session) {
-            [_session stopRunning];
-            _session = nil;
+        AVCaptureSession *s = _session;
+        _session = nil;
+        if (s) {
+            // stopRunning blocks as well: keep it off the sample-buffer queue
+            dispatch_async(_sq, ^{
+                @autoreleasepool {
+                    @try { [s stopRunning]; } @catch (NSException *e) {}
+                }
+            });
         }
     } @catch (NSException *e) {
         FU_LOG(@"teardown: %@", e.reason);
@@ -526,11 +534,24 @@ static float FUPrefFloat(NSString *key, float def) {
 
             AVCaptureVideoDataOutput *out = [(id)FUClass(@"AVCaptureVideoDataOutput") new];
             out.alwaysDiscardsLateVideoFrames = YES;
-            // literal "PixelFormatType" / 'BGRA' instead of the CoreVideo externs
-            out.videoSettings = @{ @"PixelFormatType": @(0x42475241u) };
             [out setSampleBufferDelegate:self queue:_q];
             if (![session canAddOutput:out]) { [self failWith:@"cannot add video output"]; return; }
             [session addOutput:out];
+
+            // Negotiate the pixel format instead of forcing it.  Asking for a
+            // format the connection cannot produce leaves the session running
+            // with zero buffers delivered — the exact "camera on, nothing
+            // arrives" failure.  Literal "PixelFormatType" / 'BGRA' avoids the
+            // CoreVideo externs (zero framework load commands).
+            @try {
+                NSArray *fmts = [out valueForKey:@"availableVideoPixelFormatTypes"];
+                FU_LOG(@"available pixel formats: %@", fmts);
+                if ([fmts isKindOfClass:[NSArray class]] &&
+                    [fmts containsObject:@(0x42475241u)]) {
+                    [out setValue:@{ @"PixelFormatType": @(0x42475241u) }
+                           forKey:@"videoSettings"];
+                }
+            } @catch (NSException *e) {}
 
             @try {
                 AVCaptureConnection *conn = [out connectionWithMediaType:@"vide"];
@@ -546,8 +567,17 @@ static float FUPrefFloat(NSString *key, float def) {
             _deadline    = [NSDate dateWithTimeIntervalSinceNow:kScanWindow];
             _session     = session;
 
-            [session startRunning];
-            FU_LOG(@"session started (gen %lu, window %.0fs)", (unsigned long)gen, kScanWindow);
+            // startRunning blocks the calling queue.  Doing it on _q (the
+            // sample-buffer queue) can starve the very first frames, so the
+            // session gets its own queue and the preview-less scan just waits.
+            dispatch_async(_sq, ^{
+                @autoreleasepool {
+                    @try { [session startRunning]; }
+                    @catch (NSException *e) { FU_LOG(@"startRunning: %@", e.reason); }
+                }
+            });
+            FU_LOG(@"session start requested (gen %lu, window %.0fs)",
+                   (unsigned long)gen, kScanWindow);
 
             // watchdog: a session that never delivers frames is the classic
             // "phone is stuck holding the camera" case

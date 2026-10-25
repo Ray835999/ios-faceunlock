@@ -17,6 +17,7 @@
 @interface FUSMainViewController : UIViewController
 @end
 
-@interface FUSEnrollViewController : UIViewController <AVCaptureVideoDataOutputSampleBufferDelegate>
+@interface FUSEnrollViewController : UIViewController
+    <AVCaptureVideoDataOutputSampleBufferDelegate, AVCapturePhotoCaptureDelegate>
 @property (nonatomic, strong) AVCaptureVideoPreviewLayer *preview;
 @end

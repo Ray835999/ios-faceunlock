@@ -141,7 +141,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                         color:[UIColor whiteColor]];
     [_scroll addSubview:_titleLabel];
 
-    _versionLabel = [self label:@"v2.0.2 · 屏内诊断版" size:12 weight:UIFontWeightRegular
+    _versionLabel = [self label:@"v2.1.0 · 双通路采集版" size:12 weight:UIFontWeightRegular
                           color:[UIColor colorWithWhite:0.6 alpha:1]];
     [_scroll addSubview:_versionLabel];
 
@@ -468,6 +468,13 @@ static const NSUInteger kSamples = 5;
 @implementation FUSEnrollViewController {
     AVCaptureSession         *_session;
     AVCaptureVideoDataOutput *_output;
+    AVCapturePhotoOutput     *_photoOut;
+    // Two queues on purpose: session configuration/start/stop and the sample
+    // buffer callbacks must never share a queue.  When startRunning() runs on
+    // the same serial queue that receives the sample buffers, the first frames
+    // can be starved for as long as startRunning takes (and on some jailbreak
+    // setups for good) even though the preview layer keeps rendering.
+    dispatch_queue_t          _sessionQueue;
     dispatch_queue_t          _queue;
     NSMutableArray           *_collected;
     UIView                   *_guide;
@@ -478,15 +485,19 @@ static const NSUInteger kSamples = 5;
     UIButton                 *_retryButton;
     NSDate                   *_lastCapture;
     NSDate                   *_lastMeter;
+    NSTimer                  *_photoTimer;
     NSUInteger                _framesSeen;
     NSUInteger                _detectRuns;
     NSUInteger                _faceHits;
     NSUInteger                _bufW;
     NSUInteger                _bufH;
+    NSUInteger                _dropsSeen;
     float                     _lastQuality;
     BOOL                      _finished;
     BOOL                      _cameraConfigured;
     BOOL                      _permissionResolved;
+    BOOL                      _photoMode;      // frame source fell back to stills
+    BOOL                      _photoInFlight;
 }
 
 - (void)viewDidLoad {
@@ -495,6 +506,8 @@ static const NSUInteger kSamples = 5;
     self.view.backgroundColor = [UIColor blackColor];
     _collected = [NSMutableArray array];
     _queue = dispatch_queue_create("com.ray835999.faceunlock.enroll", DISPATCH_QUEUE_SERIAL);
+    _sessionQueue = dispatch_queue_create("com.ray835999.faceunlock.session",
+                                          DISPATCH_QUEUE_SERIAL);
 
     _preview = [AVCaptureVideoPreviewLayer new];
     _preview.videoGravity = AVLayerVideoGravityResizeAspectFill;
@@ -578,8 +591,9 @@ static const NSUInteger kSamples = 5;
     _cancelButton.frame  = CGRectMake(insets.left + 16, insets.top + 8, 68, 38);
     _progressLabel.frame = CGRectMake(16, insets.top + 12, w - 32, 30);
     _hintLabel.frame     = CGRectMake(24, CGRectGetMaxY(_guide.frame) + 18, w - 48, 46);
-    _retryButton.frame   = CGRectMake((w - 220) / 2, h - insets.bottom - 130, 220, 50);
-    _meterLabel.frame    = CGRectMake(12, h - insets.bottom - 10 - 46, w - 24, 46);
+    _retryButton.frame   = CGRectMake((w - 220) / 2, h - insets.bottom - 152, 220, 50);
+    // two lines of monospaced text + room to wrap the diagnostic note
+    _meterLabel.frame    = CGRectMake(12, h - insets.bottom - 14 - 66, w - 24, 66);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -666,43 +680,74 @@ static const NSUInteger kSamples = 5;
             return;
         }
         AVCaptureSession *session = [AVCaptureSession new];
-        session.sessionPreset = AVCaptureSessionPreset640x480;
-        if (![session canAddInput:input]) { [self failWith:@"无法添加相机输入"]; return; }
-        [session addInput:input];
-
         AVCaptureVideoDataOutput *out = [AVCaptureVideoDataOutput new];
         out.alwaysDiscardsLateVideoFrames = YES;
-        out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey :
-                               @(kCVPixelFormatType_32BGRA) };
-        [out setSampleBufferDelegate:self queue:_queue];
-        if (![session canAddOutput:out]) { [self failWith:@"无法添加视频输出"]; return; }
+        AVCapturePhotoOutput *photoOut = [AVCapturePhotoOutput new];
+
+        // One atomic configuration.  videoSettings is deliberately NOT set here:
+        // it is chosen below from what the output actually supports, because
+        // forcing a format the connection cannot produce leaves the preview
+        // rendering while the data output never delivers a single buffer.
+        [session beginConfiguration];
+        session.sessionPreset = AVCaptureSessionPreset640x480;
+        if (![session canAddInput:input]) {
+            [session commitConfiguration];
+            [self failWith:@"无法添加相机输入"];
+            return;
+        }
+        [session addInput:input];
+        if (![session canAddOutput:out]) {
+            [session commitConfiguration];
+            [self failWith:@"无法添加视频输出"];
+            return;
+        }
         [session addOutput:out];
+        BOOL photoAdded = NO;
+        if ([session canAddOutput:photoOut]) {
+            [session addOutput:photoOut];
+            photoAdded = YES;
+        }
+        [session commitConfiguration];
+
+        NSArray *fmts = out.availableVideoPixelFormatTypes;
+        unsigned int chosen = 0;
+        if ([fmts containsObject:@(kCVPixelFormatType_32BGRA)]) {
+            chosen = kCVPixelFormatType_32BGRA;
+            out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(chosen) };
+        }
+        [out setSampleBufferDelegate:self queue:_queue];
 
         AVCaptureConnection *conn = [out connectionWithMediaType:AVMediaTypeVideo];
-        if (conn && conn.supportsVideoOrientation) {
-            conn.videoOrientation = AVCaptureVideoOrientationPortrait;
-        }
+        if (conn && !conn.enabled) conn.enabled = YES;
+        FUSLog(@"session: preset=%@ fmts=%@ chosen=%u photoOut=%d conn=%d enabled=%d",
+               session.sessionPreset, fmts, chosen, (int)photoAdded,
+               (int)(conn != nil), (int)(conn ? conn.enabled : NO));
 
         _session = session;
         _output = out;
+        _photoOut = photoAdded ? photoOut : nil;
         _preview.session = session;
         _cameraConfigured = YES;
         _hintLabel.text = @"把脸放进圆圈里，保持不动";
         _retryButton.hidden = YES;
-        FUSLog(@"camera configured, starting session");
-        dispatch_async(_queue, ^{ [session startRunning]; });
+        // startRunning blocks: never on the delegate queue, never on main
+        dispatch_async(_sessionQueue, ^{
+            @autoreleasepool {
+                @try { [session startRunning]; FUSLog(@"session isRunning=%d", (int)session.isRunning); }
+                @catch (NSException *e) { FUSLog(@"startRunning: %@", e.reason); }
+            }
+        });
 
-        // Watchdog: a preview can appear while the data output delivers nothing
-        // (TCC denied at the process level, or the device is held elsewhere).
-        // Without this the user just stares at a working-looking camera forever.
+        // Watchdog: a preview can appear while the data output delivers nothing.
+        // Instead of only complaining, switch the frame source to still capture,
+        // which is a completely separate pipeline and still feeds Vision.
         __weak FUSEnrollViewController *weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             FUSEnrollViewController *ss = weakSelf;
-            if (!ss || ss->_finished || !ss->_cameraConfigured) return;
+            if (!ss || ss->_finished || !ss->_cameraConfigured || ss->_photoMode) return;
             if (ss->_framesSeen > 0) return;
-            FUSLog(@"WATCHDOG: 0 frames 4s after startRunning");
-            [ss setHint:@"相机在跑，但一帧画面都没收到\n（相机权限被拦，或被别的 App 占着）"];
+            [ss switchToPhotoMode];
         });
     } @catch (NSException *e) {
         FUSLog(@"configureCamera exception: %@", e.reason);
@@ -710,12 +755,60 @@ static const NSUInteger kSamples = 5;
     }
 }
 
+// The video data output never handed us a buffer.  Grab individual stills via
+// AVCapturePhotoOutput instead: on-demand capture goes through a different path
+// than streamed sample buffers, so it works in setups where the stream is mute.
+- (void)switchToPhotoMode {
+    if (_photoMode || _finished) return;
+    FUSLog(@"SWITCH: 0 video frames -> photo capture mode (photoOut=%@ drops=%lu)",
+           _photoOut ? @"yes" : @"no", (unsigned long)_dropsSeen);
+    if (!_photoOut) {
+        [self setHint:@"相机有画面，但取不到任何帧\n（视频流和拍照通路都不可用）"];
+        return;
+    }
+    _photoMode = YES;
+    _framesSeen = 0;
+    [self setHint:@"视频流取不到帧，已改用逐张拍照识别…"];
+    _photoTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                   target:self
+                                                 selector:@selector(capturePhotoTick)
+                                                 userInfo:nil
+                                                  repeats:YES];
+    [self capturePhotoTick];
+
+    __weak FUSEnrollViewController *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss || ss->_finished || !ss->_photoMode) return;
+        if (ss->_framesSeen > 0) return;
+        FUSLog(@"SWITCH: photo mode also produced nothing");
+        [ss setHint:@"连拍照也拿不到画面\n请关掉其它用相机的 App 后点重试"];
+    });
+}
+
+- (void)capturePhotoTick {
+    if (_finished || _photoInFlight || !_photoOut) return;
+    if (!_session.isRunning) return;
+    _photoInFlight = YES;
+    @try {
+        AVCapturePhotoSettings *settings = [AVCapturePhotoSettings photoSettings];
+        [_photoOut capturePhotoWithSettings:settings delegate:self];
+    } @catch (NSException *e) {
+        _photoInFlight = NO;
+        FUSLog(@"capturePhoto exception: %@", e.reason);
+    }
+}
+
 - (void)stopCamera {
+    if (_photoTimer) { [_photoTimer invalidate]; _photoTimer = nil; }
+    _photoMode = NO;
+    _photoInFlight = NO;
     AVCaptureSession *s = _session;
     _session = nil;
     _cameraConfigured = NO;
     if (s) {
-        dispatch_async(_queue, ^{
+        dispatch_async(_sessionQueue, ^{
             @try { [s stopRunning]; } @catch (NSException *e) {}
         });
     }
@@ -758,12 +851,15 @@ static const NSUInteger kSamples = 5;
     _lastMeter = now;
     // Two lines: the counters, then where the detection pipeline actually is.
     // A screenshot of this is enough to tell which stage is broken.
+    // 源 video = the streamed video output is delivering frames
+    // 源 photo = its buffers never came, stills are being used instead
     NSString *text = [NSString stringWithFormat:
-        @"帧 %lu · 检测 %lu · 命中 %lu · 方向 %@ · 质量 %.2f\n%@ · 缓冲 %lux%lu · %@",
+        @"帧 %lu · 检测 %lu · 命中 %lu · 源 %@\n%@ %lux%lu 丢%lu 方向%@ · %@",
         (unsigned long)_framesSeen, (unsigned long)_detectRuns, (unsigned long)_faceHits,
-        [FacePrint orientationName:[FacePrint workingOrientation]], _lastQuality,
-        [FacePrint visionAvailable] ? @"Vision OK" : @"Vision 不可用",
-        (unsigned long)_bufW, (unsigned long)_bufH,
+        _photoMode ? @"照片" : @"视频",
+        [FacePrint visionAvailable] ? @"Vision" : @"无Vision",
+        (unsigned long)_bufW, (unsigned long)_bufH, (unsigned long)_dropsSeen,
+        [FacePrint orientationName:[FacePrint workingOrientation]],
         [FacePrint lastDetectNote] ?: @"-"];
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self->_finished) self->_meterLabel.text = text;
@@ -774,84 +870,126 @@ static const NSUInteger kSamples = 5;
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
     @autoreleasepool {
-        @try {
-            if (_finished || _collected.count >= kSamples) return;
-            _framesSeen++;
+        CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
+        if (!pb) return;
+        _framesSeen++;
+        [self processPixelBuffer:pb];
+    }
+}
 
-            NSDate *now = [NSDate date];
-            if (_lastCapture && [now timeIntervalSinceDate:_lastCapture] < 0.7) {
-                [self publishMeter];
-                return;
-            }
-            _lastCapture = now;
-            _detectRuns++;
+// Delegate too slow / starved: AVFoundation reports discarded buffers here.
+// A non-zero count proves the camera IS producing frames, which is the only way
+// to tell "no frames at all" apart from "frames dropped before reaching us".
+- (void)captureOutput:(AVCaptureOutput *)output
+didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer
+       fromConnection:(AVCaptureConnection *)connection {
+    _dropsSeen++;
+    if (_dropsSeen == 1 || _dropsSeen % 25 == 0) {
+        FUSLog(@"dropped buffers: %lu (video frames seen %lu)",
+               (unsigned long)_dropsSeen, (unsigned long)_framesSeen);
+    }
+}
 
-            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
-            if (!pb) { [self publishMeter]; return; }
-            _bufW = CVPixelBufferGetWidth(pb);
-            _bufH = CVPixelBufferGetHeight(pb);
-
-            if (_detectRuns % 20 == 0) {
-                FUSLog(@"diag #%lu: frames=%lu faces=%lu buf=%lux%lu orient=%@ note=%@",
-                       (unsigned long)_detectRuns, (unsigned long)_framesSeen,
-                       (unsigned long)_faceHits, (unsigned long)_bufW, (unsigned long)_bufH,
-                       [FacePrint orientationName:[FacePrint workingOrientation]],
-                       [FacePrint lastDetectNote]);
-            }
-
-            float q = -1.0f;
-            // qualityGate:NO on purpose — a mediocre-quality face must still be
-            // enrollable. The tweak uses the same setting, so both sides accept
-            // the same faces and their prints stay comparable.
-            VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb
-                                                             qualityGate:NO
-                                                                 quality:&q];
-            _lastQuality = q;
-            [self publishMeter];
-
-            if (!face) {
-                // q >= 0 means a face WAS found but rejected for quality, so the
-                // advice differs from "no face at all". Keeping these apart is
-                // what made the old build look like the camera was dead.
-                if (q >= 0.0f) {
-                    [self setHint:[NSString stringWithFormat:
-                        @"看到脸了，但画面太暗/太糊（质量 %.2f）\n换个亮一点的地方", q]];
-                } else {
-                    [self setHint:[NSString stringWithFormat:
-                        @"没检测到人脸 · 正对镜头，别侧头（已检测 %lu 次）",
-                        (unsigned long)_detectRuns]];
-                }
-                return;
-            }
-
-            _faceHits++;
-            VNFeaturePrintObservation *print =
-                [FacePrint observationForFace:face pixelBuffer:pb logPrefix:@"app"];
-            if (!print) {
-                [self setHint:@"检测到人脸，但特征提取失败（再靠近一点）"];
-                return;
-            }
-
-            NSDictionary *tmpl = [FacePrint templateForPrint:print];
-            if (!tmpl) return;
-            [_collected addObject:tmpl];
-            NSUInteger n = _collected.count;
-            FUSLog(@"sample %lu/%lu collected (quality %.2f)",
-                   (unsigned long)n, (unsigned long)kSamples, q);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (self->_finished) return;
-                self->_progressLabel.text = [NSString stringWithFormat:@"%lu / %lu",
-                                             (unsigned long)n, (unsigned long)kSamples];
-                self->_hintLabel.text = (n >= kSamples) ? @"采集完成，正在保存…"
-                                                        : @"很好，稍微换个角度";
-            });
-            if (n >= kSamples) {
-                _finished = YES;
-                dispatch_async(dispatch_get_main_queue(), ^{ [self finish]; });
-            }
-        } @catch (NSException *e) {
-            FUSLog(@"frame exception: %@", e.reason);
+// Still-capture path, used when the streamed buffers never arrive.
+- (void)photoOutput:(AVCapturePhotoOutput *)output
+didFinishProcessingPhoto:(AVCapturePhoto *)photo
+              error:(NSError *)error {
+    _photoInFlight = NO;
+    if (error) {
+        FUSLog(@"photo error: %@", error.localizedDescription ?: @"?");
+        return;
+    }
+    CVPixelBufferRef pb = photo.pixelBuffer;
+    if (!pb) { FUSLog(@"photo has no pixel buffer"); return; }
+    CVPixelBufferRetain(pb);
+    dispatch_async(_queue, ^{
+        @autoreleasepool {
+            self->_framesSeen++;
+            [self processPixelBuffer:pb];
+            CVPixelBufferRelease(pb);
         }
+    });
+}
+
+// Runs on _queue (serial) for BOTH frame sources, so the sampling logic is
+// shared and a late-arriving video stream cannot interleave with photo stills.
+- (void)processPixelBuffer:(CVPixelBufferRef)pb {
+    @try {
+        if (_finished || _collected.count >= kSamples) return;
+        NSDate *now = [NSDate date];
+        if (_lastCapture && [now timeIntervalSinceDate:_lastCapture] < 0.7) {
+            [self publishMeter];
+            return;
+        }
+        _lastCapture = now;
+        _detectRuns++;
+
+        _bufW = CVPixelBufferGetWidth(pb);
+        _bufH = CVPixelBufferGetHeight(pb);
+
+        if (_detectRuns % 20 == 0) {
+            FUSLog(@"diag #%lu: frames=%lu drops=%lu faces=%lu buf=%lux%lu src=%@ orient=%@ note=%@",
+                   (unsigned long)_detectRuns, (unsigned long)_framesSeen,
+                   (unsigned long)_dropsSeen, (unsigned long)_faceHits,
+                   (unsigned long)_bufW, (unsigned long)_bufH,
+                   _photoMode ? @"photo" : @"video",
+                   [FacePrint orientationName:[FacePrint workingOrientation]],
+                   [FacePrint lastDetectNote]);
+        }
+
+        float q = -1.0f;
+        // qualityGate:NO on purpose — a mediocre-quality face must still be
+        // enrollable. The tweak uses the same setting, so both sides accept
+        // the same faces and their prints stay comparable.
+        VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb
+                                                         qualityGate:NO
+                                                             quality:&q];
+        _lastQuality = q;
+        [self publishMeter];
+
+        if (!face) {
+            // q >= 0 means a face WAS found but rejected for quality, so the
+            // advice differs from "no face at all". Keeping these apart is
+            // what made the old build look like the camera was dead.
+            if (q >= 0.0f) {
+                [self setHint:[NSString stringWithFormat:
+                    @"看到脸了，但画面太暗/太糊（质量 %.2f）\n换个亮一点的地方", q]];
+            } else {
+                [self setHint:[NSString stringWithFormat:
+                    @"没检测到人脸 · 正对镜头，别侧头（已检测 %lu 次）",
+                    (unsigned long)_detectRuns]];
+            }
+            return;
+        }
+
+        _faceHits++;
+        VNFeaturePrintObservation *print =
+            [FacePrint observationForFace:face pixelBuffer:pb logPrefix:@"app"];
+        if (!print) {
+            [self setHint:@"检测到人脸，但特征提取失败（再靠近一点）"];
+            return;
+        }
+
+        NSDictionary *tmpl = [FacePrint templateForPrint:print];
+        if (!tmpl) return;
+        [_collected addObject:tmpl];
+        NSUInteger n = _collected.count;
+        FUSLog(@"sample %lu/%lu collected (quality %.2f, src=%@)",
+               (unsigned long)n, (unsigned long)kSamples, q,
+               _photoMode ? @"photo" : @"video");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self->_finished) return;
+            self->_progressLabel.text = [NSString stringWithFormat:@"%lu / %lu",
+                                         (unsigned long)n, (unsigned long)kSamples];
+            self->_hintLabel.text = (n >= kSamples) ? @"采集完成，正在保存…"
+                                                    : @"很好，稍微换个角度";
+        });
+        if (n >= kSamples) {
+            _finished = YES;
+            dispatch_async(dispatch_get_main_queue(), ^{ [self finish]; });
+        }
+    } @catch (NSException *e) {
+        FUSLog(@"frame exception: %@", e.reason);
     }
 }
 
