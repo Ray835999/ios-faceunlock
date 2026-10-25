@@ -1,6 +1,6 @@
 Package: com.ray835999.faceunlock
 Name: FaceUnlock
-Version: 2.1.0
+Version: 2.2.0
 Architecture: iphoneos-arm64
 Description: Camera-based face unlock for Touch ID devices (iOS 15 rootless).
 Depends: mobilesubstrate

@@ -255,6 +255,20 @@ static const NSTimeInterval kNoFrameTimeout   = 3.0;
 static const NSUInteger    kRequiredMatches   = 2;
 static const int           kMaxCameraFailures = 3;
 
+// v2.2.0 — pixel formats tried in order. 420f/420v are what the front camera
+// natively produces; 32BGRA is the format that shows up in
+// availableVideoCVPixelFormatTypes yet does not always flow, which is exactly
+// the "preview renders, data output never fires" failure.
+static const NSUInteger    kFmtLadderCount    = 3;
+
+static OSType FUFormatForAttempt(NSUInteger i) {
+    switch (i) {
+        case 0:  return 0x34323066u;   // '420f'
+        case 1:  return 0x34323076u;   // '420v'
+        default: return 0x42475241u;   // 'BGRA'
+    }
+}
+
 @implementation FaceUnlockManager {
     // main thread
     BOOL             _started;
@@ -274,6 +288,7 @@ static const int           kMaxCameraFailures = 3;
     float            _best;
     long long        _failStreak;
     NSTimeInterval   _lastLog;
+    NSUInteger       _fmtAttempt;   // rung of the pixel-format ladder (v2.2.0)
 
     // shared
     NSObject        *_tplLock;
@@ -344,7 +359,7 @@ static float FUPrefFloat(NSString *key, float def) {
     @try {
         NSDictionary *bundle = [[NSBundle mainBundle] infoDictionary];
         FUStatusSet(@"hostUp", @YES);
-        FUStatusSet(@"version", @"2.0.0");
+        FUStatusSet(@"version", @"2.2.0");
         FUStatusSet(@"hostVersion", bundle[@"CFBundleVersion"] ?: @"?");
         FUStatusSet(@"device", [[UIDevice currentDevice] systemVersion]);
         FUStatusSet(@"state", @"idle");
@@ -445,6 +460,7 @@ static float FUPrefFloat(NSString *key, float def) {
 
         _gen++;
         _armed = YES;
+        _fmtAttempt = 0;     // a new lock starts the format ladder from the top
         NSUInteger gen = _gen;
         FUStatusSet(@"state", @"scanning");
         FUStatusAdd(@"sessions", 1);
@@ -527,30 +543,48 @@ static float FUPrefFloat(NSString *key, float def) {
             if (!input) { [self failWith:[NSString stringWithFormat:@"camera input: %@",
                                          err.localizedDescription ?: @"?"]]; return; }
 
+            // v2.2.0 — the pixel format comes from a ladder and is applied
+            // BEFORE addOutput.  Setting videoSettings on an output that is
+            // already part of a committed session is not honoured by every
+            // AVFoundation build: the connection then stays mute for good
+            // while a preview layer keeps rendering — exactly "camera on,
+            // zero frames".  The native bi-planar formats are tried first
+            // because 32BGRA is advertised by the front camera yet does not
+            // always flow.  Literal "PixelFormatType" + raw OSType values keep
+            // the dylib free of CoreVideo load commands.
+            OSType fmt = FUFormatForAttempt(_fmtAttempt);
             AVCaptureSession *session = [(id)FUClass(@"AVCaptureSession") new];
-            session.sessionPreset = @"AVCaptureSessionPreset640x480";
-            if (![session canAddInput:input]) { [self failWith:@"cannot add camera input"]; return; }
-            [session addInput:input];
-
             AVCaptureVideoDataOutput *out = [(id)FUClass(@"AVCaptureVideoDataOutput") new];
             out.alwaysDiscardsLateVideoFrames = YES;
-            [out setSampleBufferDelegate:self queue:_q];
-            if (![session canAddOutput:out]) { [self failWith:@"cannot add video output"]; return; }
-            [session addOutput:out];
-
-            // Negotiate the pixel format instead of forcing it.  Asking for a
-            // format the connection cannot produce leaves the session running
-            // with zero buffers delivered — the exact "camera on, nothing
-            // arrives" failure.  Literal "PixelFormatType" / 'BGRA' avoids the
-            // CoreVideo externs (zero framework load commands).
             @try {
-                NSArray *fmts = [out valueForKey:@"availableVideoCVPixelFormatTypes"];
-                FU_LOG(@"available pixel formats: %@", fmts);
-                if ([fmts isKindOfClass:[NSArray class]] &&
-                    [fmts containsObject:@(0x42475241u)]) {
-                    [out setValue:@{ @"PixelFormatType": @(0x42475241u) }
-                           forKey:@"videoSettings"];
-                }
+                [out setValue:@{ @"PixelFormatType": @(fmt) } forKey:@"videoSettings"];
+            } @catch (NSException *e) {}
+
+            [session beginConfiguration];
+            if ([session canSetSessionPreset:@"AVCaptureSessionPreset640x480"]) {
+                session.sessionPreset = @"AVCaptureSessionPreset640x480";
+            }
+            if (![session canAddInput:input]) {
+                [session commitConfiguration];
+                [self failWith:@"cannot add camera input"];
+                return;
+            }
+            [session addInput:input];
+
+            [out setSampleBufferDelegate:self queue:_q];
+            if (![session canAddOutput:out]) {
+                [session commitConfiguration];
+                [self failWith:@"cannot add video output"];
+                return;
+            }
+            [session addOutput:out];
+            [session commitConfiguration];
+
+            @try {
+                FU_LOG(@"attempt %lu: fmt=0x%08x listed=%@ preset=%@",
+                       (unsigned long)_fmtAttempt, (unsigned)fmt,
+                       [out valueForKey:@"availableVideoCVPixelFormatTypes"],
+                       session.sessionPreset);
             } @catch (NSException *e) {}
 
             @try {
@@ -579,18 +613,20 @@ static float FUPrefFloat(NSString *key, float def) {
             FU_LOG(@"session start requested (gen %lu, window %.0fs)",
                    (unsigned long)gen, kScanWindow);
 
-            // watchdog: a session that never delivers frames is the classic
-            // "phone is stuck holding the camera" case
+            // watchdog: a session that runs but never delivers a buffer is
+            // either "phone is stuck holding the camera" or "the pixel format
+            // does not really flow". The second case is fixed by rebuilding
+            // with the next format, so that is tried before giving up.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          (int64_t)(kNoFrameTimeout * NSEC_PER_SEC)),
                            _q, ^{
                 @autoreleasepool {
                     if (gen != self->_runGen) return;
                     if (self->_frames > 0) return;
-                    FU_LOG(@"WATCHDOG: 0 frames in %.0fs - tearing the session down", kNoFrameTimeout);
-                    FUStatusSet(@"state", @"no frames (camera not delivering)");
-                    [self teardown];
-                    [self countCameraFailure];
+                    FU_LOG(@"WATCHDOG: 0 frames in %.0fs with fmt 0x%08x",
+                           kNoFrameTimeout, (unsigned)fmt);
+                    FUStatusSet(@"state", @"no frames (trying next pixel format)");
+                    [self retryWithNextFormat];
                 }
             });
         } @catch (NSException *e) {
@@ -598,6 +634,37 @@ static float FUPrefFloat(NSString *key, float def) {
             [self failWith:[NSString stringWithFormat:@"session: %@", e.reason ?: @"?"]];
         }
     }
+}
+
+// capture queue only. A session can run and still never hand a single buffer
+// to the data output when the requested pixel format does not really flow.
+// That is a session-level problem, not a broken camera, so it must not count
+// towards the kill switch: rebuild with the next format first.
+- (void)retryWithNextFormat {
+    if (_fmtAttempt + 1 >= kFmtLadderCount) {
+        FU_LOG(@"pixel-format ladder exhausted - the camera is not delivering at all");
+        FUStatusSet(@"state", @"no frames (all pixel formats tried)");
+        [self teardown];
+        [self countCameraFailure];
+        return;
+    }
+    _fmtAttempt++;
+    _frames = 0;
+    FU_LOG(@"rebuilding the session with pixel format #%lu", (unsigned long)_fmtAttempt);
+    [self teardown];      // stop() is queued on _sq, so it is ordered before the restart
+    __weak FaceUnlockManager *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        FaceUnlockManager *ss = weakSelf;
+        if (!ss) return;
+        // new generation: every watchdog armed for the old one becomes a no-op,
+        // and the flag has to be raised again because teardown() cleared it
+        ss->_gen++;
+        ss->_armed = YES;
+        NSUInteger g = ss->_gen;
+        FU_LOG(@"format retry -> scan #%lu", (unsigned long)g);
+        dispatch_async(ss->_q, ^{ @autoreleasepool { [ss runSessionGen:g]; } });
+    });
 }
 
 // capture queue only

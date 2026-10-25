@@ -1,4 +1,4 @@
-# FaceUnlock 2.1.0 — 摄像头人脸解锁（iPhone 6s / iOS 15 rootless）
+# FaceUnlock 2.2.0 — 摄像头人脸解锁（iPhone 6s / iOS 15 rootless）
 
 用**前置摄像头 + Vision 人脸特征指纹**在越狱的 Touch ID 机型上实现人脸解锁，
 是 Vizage（foxfortmobile，$3.99）的免费自建平替。
@@ -12,6 +12,48 @@
 | **FaceUnlock.dylib**（SpringBoard 插件） | 锁屏匹配 + 解锁，无 UI |
 
 录入和匹配跑的是**同一份 `FacePrint.m`**，两边特征指纹可直接比对。
+
+---
+
+## 2.2.0 修的是什么（"预览活的、帧 0、连拍照也没有"）
+
+截图给出的信息已经足够定位：**预览层在渲染，说明会话在跑、摄像头在出图**；
+但 `帧 0` 且拍照通路 0 张，说明**两条数据连接都没建立成功**。这不是权限、不是 Vision、
+也不是"摄像头被别的 App 占着"。
+
+v2.1.0 的猜测方向（队列共享、格式协商）只对了一半。真正的坑是**应用时机**：
+`videoSettings` 是在 `commitConfiguration` **之后**才设到 output 上的。对一个已经进入
+会话的连接改像素格式，不是每个 AVFoundation 构建都会照做 —— 连接就这么静默地哑掉，
+而预览层用的是它自己的连接，照旧渲染。
+
+按三条规则重做采集层：
+
+| 规则 | 做法 |
+|---|---|
+| **① 先设格式再挂 output** | `videoSettings` 在 `addOutput:` **之前**写入，全程包在 `beginConfiguration` / `commitConfiguration` 里 |
+| **② 原生格式优先** | 依次试 `420f → 420v → BGRA`，并换一次 preset（640×480 → High）。BGRA 常常出现在 `availableVideoCVPixelFormatTypes` 里却根本不出数据 |
+| **③ 每档都是全新会话** | 每档建一个全新 session（旧的在会话队列上按序 stop），**2 秒没出帧就自动换下一档**，不需要用户点任何东西 |
+
+四档视频全哑 → 换成**只挂 `AVCapturePhotoOutput` 的独立会话**（预览 + 按需拍照，1 张/秒）；
+仍然拿不到 → 直接调 **系统相机 UI（`UIImagePickerController`）**，让用户按 5 次快门。
+系统相机是苹果自己的管道，不存在"连接哑掉"这回事，所以这条路必然能完成录入。
+
+四条路径（视频流 / 照片 / 系统相机 / 以后锁屏匹配）全部走同一个 `processPixelBuffer:`，
+特征指纹仍然可比。
+
+底部计量改成三行，一张截图就能判断卡在哪：
+
+```
+帧 128 检测 12 命中 11  第1档
+源 视频 420f  640x480 丢0
+run1 act1 en1 · rect: 1 face(s) (orient right)
+```
+
+第三行的 `run/act/en` 是会话启动后的真实连接状态，`act0` 就是"连接没激活"。
+
+插件侧同步改造：像素格式同样在 `addOutput` 之前写入、同样是 `420f → 420v → BGRA` 阶梯，
+3 秒无帧先换下一档重建会话，**四档都失败才计入崩溃计数**（避免把"格式不对"误判成
+"摄像头坏了"而自动禁用）。
 
 ---
 
@@ -115,12 +157,14 @@ Vision 640x480 丢0 方向right · rect: 1 face(s)
 
 ## 使用方法
 
-1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_2.1.0-1+debug_iphoneos-arm64.deb`。
+1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_2.2.0-1+debug_iphoneos-arm64.deb`。
 2. 传到手机（Filza / SSH），Sileo / Zebra 安装或 `dpkg -i`（rootless 自动装到 `/var/jb`）。
    安装脚本会自动 `uicache`，桌面出现 **FaceUnlock** 图标。
 3. **先设好锁屏密码**（和 Vizage 一样的前提）。
 4. **重装后必须注销/重启一次**，否则插件不会重新注入 SpringBoard。
 5. 打开 **FaceUnlock** → 点 **① 开始录入人脸** → 把脸放进圆圈，自动采集 5 个样本。
+   如果底部一直 `帧 0`，它会自己换格式重试；四档都失败时右下角会出现 **系统相机拍照**，
+   用它按 5 次快门一样能完成录入。
 6. 锁屏，把脸对准前置摄像头。
 
 > App 首页顶部那张状态卡就是诊断面板：`当前状态` / `SB相机权限` / `会话/帧/脸` /
