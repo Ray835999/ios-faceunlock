@@ -709,7 +709,7 @@ static const NSUInteger kSamples = 5;
         }
         [session commitConfiguration];
 
-        NSArray *fmts = out.availableVideoPixelFormatTypes;
+        NSArray *fmts = out.availableVideoCVPixelFormatTypes;
         unsigned int chosen = 0;
         if ([fmts containsObject:@(kCVPixelFormatType_32BGRA)]) {
             chosen = kCVPixelFormatType_32BGRA;

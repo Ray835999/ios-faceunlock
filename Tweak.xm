@@ -544,7 +544,7 @@ static float FUPrefFloat(NSString *key, float def) {
             // arrives" failure.  Literal "PixelFormatType" / 'BGRA' avoids the
             // CoreVideo externs (zero framework load commands).
             @try {
-                NSArray *fmts = [out valueForKey:@"availableVideoPixelFormatTypes"];
+                NSArray *fmts = [out valueForKey:@"availableVideoCVPixelFormatTypes"];
                 FU_LOG(@"available pixel formats: %@", fmts);
                 if ([fmts isKindOfClass:[NSArray class]] &&
                     [fmts containsObject:@(0x42475241u)]) {
