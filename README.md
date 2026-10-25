@@ -32,11 +32,15 @@ Vizage（foxfortmobile，$3.99）是唯一在维护的同类商业插件；本�
 
 ## 安装
 
-1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_1.2.1-1+debug_iphoneos-arm64.deb`。
+1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_1.2.2-1+debug_iphoneos-arm64.deb`。
 2. 传到手机（Filza/SSH），Sileo/Zebra 安装或 `dpkg -i`（rootless 环境自动装到 `/var/jb`）。
    安装脚本会自动跑 `uicache`，桌面出现 **FaceUnlock** 图标
    （若图标没出现，手动执行 `uicache` 或 `ldrestart`）。
 3. **必须先设锁屏密码**（和 Vizage 一样的要求）。
+4. v1.2.2 起首次打开 App 会**自动弹一个「启动诊断」框**（不需要点任何按钮）——
+   这是给「App 能打开但按钮点不动」类问题做的被动取证。看完点
+   **「关闭诊断」** 即永久关闭；完整日志在
+   `/var/jb/var/mobile/Library/FaceUnlock/ui-diagnostic.log`。
 
 ## 使用（empirical 验证流程）
 
@@ -59,8 +63,24 @@ Vizage（foxfortmobile，$3.99）是唯一在维护的同类商业插件；本�
 - 想录第二个人的脸：App 里先「清除」，再让对方录 5 次即可。
 - 每次扫描会话结束会打印 `scan session best distance=...`，这是调 Threshold 的依据。
 
-## 如果进 Safe Mode / SpringBoard 崩溃（v1.2.0 排查 SOP）
+## 如果 App 能打开但按钮点不动（v1.2.2 被动诊断 SOP）
 
+v1.2.2 起 App 启动 1.5 秒后会**自动**把 UI 状态写进
+`/var/jb/var/mobile/Library/FaceUnlock/ui-diagnostic.log`（并弹一次框展示），
+不需要用户点任何按钮。日志格式固定，三种根因可直接区分：
+
+| 日志特征 | 根因 | 处理 |
+|---|---|---|
+| 没有 `event: touches` 行，且 `snapshot` 里 `key=0` | 窗口可见但**不是 key window**（收不到任何触摸） | v1.2.2 已在 `applicationDidBecomeActive` 自动重抢 key；若仍复现，把 `snapshot` 行发来 |
+| `didFinishLaunching: begin` 之后日志戛然而止 | 主线程在启动阶段卡死 | 看最后一条面包屑停在哪，把日志发来 |
+| 有 `event: touches` 行但点击无反应 | 事件到了窗口、视图树不该拦的 | 看 `hits=` 三点 hitTest 结果 + 是否有 `force-enabling` 行（v1.2.2 会自动放开并记录） |
+
+- `snapshot` 行里的 `events=` 是启动至今窗口收到的触摸事件总数——用户点过还是 0，
+  就 100% 是「窗口失键/应用未激活」，与 App 代码无关。
+- 录入界面相机任何失败都会**显示具体原因 + 「重试打开相机」按钮**，不会再黑屏干等。
+- 急停：建文件 `/var/jb/var/mobile/Library/FaceUnlock/DISABLED` 可完全停用插件（不影响 App）。
+
+## 如果进 Safe Mode / SpringBoard 崩溃（v1.2.0 排查 SOP）
 按日志三阶段定位（**按顺序看，能直接指出崩在哪一层**）：
 
 ```bash
