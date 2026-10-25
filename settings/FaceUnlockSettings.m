@@ -1975,7 +1975,7 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         UIDocumentPickerViewController *dp = [[UIDocumentPickerViewController alloc]
                      initWithDocumentTypes:@[@"public.image"]
-                                   inMode:UIDocumentPickerViewControllerInModeImport];
+                                   inMode:UIDocumentPickerModeImport];
 #pragma clang diagnostic pop
         dp.delegate = ss;
         dp.allowsMultipleSelection = YES;
