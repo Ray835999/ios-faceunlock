@@ -263,9 +263,14 @@ static const NSUInteger    kFmtLadderCount    = 3;
 
 static OSType FUFormatForAttempt(NSUInteger i) {
     switch (i) {
-        case 0:  return 0x34323066u;   // '420f'
-        case 1:  return 0x34323076u;   // '420v'
-        default: return 0x42475241u;   // 'BGRA'
+        // v2.3.0: rung 0 means "do not touch videoSettings at all". Forcing a
+        // pixel format on the data output is what muted the connection on the
+        // 6s front camera (preview kept rendering, zero buffers arrived), so
+        // AVFoundation negotiates first and explicit formats are only the
+        // fallback.
+        case 0:  return 0;
+        case 1:  return 0x34323066u;   // '420f'
+        default: return 0x34323076u;   // '420v'
     }
 }
 
@@ -359,7 +364,7 @@ static float FUPrefFloat(NSString *key, float def) {
     @try {
         NSDictionary *bundle = [[NSBundle mainBundle] infoDictionary];
         FUStatusSet(@"hostUp", @YES);
-        FUStatusSet(@"version", @"2.2.0");
+        FUStatusSet(@"version", @"2.3.0");
         FUStatusSet(@"hostVersion", bundle[@"CFBundleVersion"] ?: @"?");
         FUStatusSet(@"device", [[UIDevice currentDevice] systemVersion]);
         FUStatusSet(@"state", @"idle");
@@ -556,9 +561,14 @@ static float FUPrefFloat(NSString *key, float def) {
             AVCaptureSession *session = [(id)FUClass(@"AVCaptureSession") new];
             AVCaptureVideoDataOutput *out = [(id)FUClass(@"AVCaptureVideoDataOutput") new];
             out.alwaysDiscardsLateVideoFrames = YES;
-            @try {
-                [out setValue:@{ @"PixelFormatType": @(fmt) } forKey:@"videoSettings"];
-            } @catch (NSException *e) {}
+            if (fmt != 0) {
+                // fmt == 0 is rung 0: leave videoSettings alone on purpose.
+                // Literal "PixelFormatType" + raw OSType values keep the dylib
+                // free of CoreVideo load commands.
+                @try {
+                    [out setValue:@{ @"PixelFormatType": @(fmt) } forKey:@"videoSettings"];
+                } @catch (NSException *e) {}
+            }
 
             [session beginConfiguration];
             if ([session canSetSessionPreset:@"AVCaptureSessionPreset640x480"]) {
@@ -581,8 +591,9 @@ static float FUPrefFloat(NSString *key, float def) {
             [session commitConfiguration];
 
             @try {
-                FU_LOG(@"attempt %lu: fmt=0x%08x listed=%@ preset=%@",
-                       (unsigned long)_fmtAttempt, (unsigned)fmt,
+                FU_LOG(@"attempt %lu: fmt=%@ listed=%@ preset=%@",
+                       (unsigned long)_fmtAttempt,
+                       fmt ? [NSString stringWithFormat:@"0x%08x", (unsigned)fmt] : @"default(0)",
                        [out valueForKey:@"availableVideoCVPixelFormatTypes"],
                        session.sessionPreset);
             } @catch (NSException *e) {}

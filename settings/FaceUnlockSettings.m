@@ -143,7 +143,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                         color:[UIColor whiteColor]];
     [_scroll addSubview:_titleLabel];
 
-    _versionLabel = [self label:@"v2.2.0 · 采集阶梯版" size:12 weight:UIFontWeightRegular
+    _versionLabel = [self label:@"v2.3.0 · 单会话版" size:12 weight:UIFontWeightRegular
                           color:[UIColor colorWithWhite:0.6 alpha:1]];
     [_scroll addSubview:_versionLabel];
 
@@ -465,65 +465,43 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 // ===========================================================================
 #pragma mark - enrollment
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// v2.3.0 — ONE session, TWO frame sources, ZERO session churn.
+//
+// Why this was rewritten instead of patched a fourth time:
+//
+//   * The 2.2.0 "format ladder" built four sessions in a row.  Every rebuild
+//     detached the preview, stopped the old session and started a new one —
+//     that is the black flash on screen ("闪一下，好像是崩了").  It also leaves
+//     the camera half-released, so the next startRunning() has no guarantee of
+//     succeeding.
+//   * Every rung *forced* a pixel format through videoSettings.  Forcing a
+//     format on AVCaptureVideoDataOutput is what muted the connection on this
+//     device: the preview kept rendering (it owns a separate connection) while
+//     the data output delivered nothing.  The video output now gets **no
+//     videoSettings at all** and lets AVFoundation negotiate.  FacePrint works
+//     through CIImage / Vision and does not care which format arrives.
+//   * When no video frame comes, stills are pulled from the SAME session via
+//     AVCapturePhotoOutput: no teardown, no second session, no flash, and no
+//     two clients fighting over the camera device.
+//   * The system camera UI is presented only after the capture session has
+//     really stopped.  In 2.2.0 the picker was presented while stopRunning()
+//     was still in flight, so Apple's own camera could not grab the device and
+//     pressing the shutter did nothing at all.
+//
+// All sources feed the single processPixelBuffer: below, so the saved
+// templates stay comparable with what the lock-screen tweak computes.
+// ---------------------------------------------------------------------------
+
+#pragma mark - enrollment
+
 static const NSUInteger kSamples = 5;
 
-// ---------------------------------------------------------------------------
-//  v2.2.0 — "preview is live but 帧 0" post-mortem
-//
-//  The screenshot that triggered this rewrite showed a perfectly live camera
-//  preview with a face inside the guide circle and a readout of 帧 0 · 检测 0.
-//  A running session that renders into AVCaptureVideoPreviewLayer but hands the
-//  AVCaptureVideoDataOutput zero buffers is not a Vision problem and not a
-//  permission problem: the preview connection and the data-output connection
-//  negotiate *separately*, and the data connection dies silently when
-//  videoSettings asks for a pixel format the connection cannot actually
-//  produce.  32BGRA is listed in availableVideoCVPixelFormatTypes on several
-//  older front cameras yet never flows — and it was the only format we asked
-//  for, on a session that had already been committed (i.e. the setting was
-//  applied to a live connection).
-//
-//  So the capture layer is rebuilt around three rules:
-//    1. videoSettings is set BEFORE addOutput:, never after commit.
-//    2. The native bi-planar formats (420f / 420v) are tried before BGRA.
-//    3. Every configuration is a fresh session, and a session that produces no
-//       frame within 2 s is torn down automatically and replaced by the next
-//       candidate — no user action.
-//  After the video ladder: a still-photo session (photo output only), and
-//  finally the system camera UI (UIImagePickerController), which cannot fail
-//  because it is Apple's own pipeline.  All four paths feed the same
-//  processPixelBuffer: so the saved templates stay byte-compatible.
-// ---------------------------------------------------------------------------
-
-static NSString *FUSFormatName(OSType f) {
-    switch (f) {
-        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:  return @"420f";
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return @"420v";
-        case kCVPixelFormatType_32BGRA:                       return @"BGRA";
-        default: return [NSString stringWithFormat:@"0x%08x", (unsigned)f];
-    }
-}
-
-static const NSUInteger kVideoAttempts = 4;
-
-static OSType FUSFormatForAttempt(NSUInteger i) {
-    switch (i) {
-        case 0:  return kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-        case 1:  return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-        case 2:  return kCVPixelFormatType_32BGRA;
-        default: return kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-    }
-}
-
-// last attempt repeats 420f but with a different preset, so a preset-related
-// negotiation failure is covered as well
-static NSString *FUSPresetForAttempt(NSUInteger i) {
-    return (i >= 3) ? AVCaptureSessionPresetHigh : AVCaptureSessionPreset640x480;
-}
-
-// UIImage (system camera) -> BGRA CVPixelBuffer, uniformly scaled so the face
-// geometry stays comparable with the live frames.  BGRA is always accepted by
-// Vision for still images; only the *streaming* connection was picky.
+// UIImage (system camera / still) -> BGRA CVPixelBuffer, uniformly scaled so
+// the face geometry stays comparable with the live frames.  A plain bitmap
+// context is used on purpose: no CIContext, no GPU context to fail to create.
 static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
+    if (![img isKindOfClass:[UIImage class]]) return NULL;
     CGImageRef cg = img.CGImage;
     if (!cg) return NULL;
     size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
@@ -535,29 +513,33 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     size_t dh = (size_t)llround((double)h * scale);
     if (dw < 2 || dh < 2) return NULL;
 
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
-                             (id)kCVPixelBufferPixelFormatTypeKey :
-                                 @(kCVPixelFormatType_32BGRA) };
+    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
     CVPixelBufferRef pb = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, dw, dh,
                             kCVPixelFormatType_32BGRA,
                             (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
         return NULL;
     }
+    if (!pb) return NULL;
 
-    static CIContext *ctx = nil;
-    if (!ctx) ctx = [CIContext contextWithOptions:nil];
-    CIImage *ci = [CIImage imageWithCGImage:cg];
-    CGFloat sx = (CGFloat)dw / ci.extent.size.width;
-    CGFloat sy = (CGFloat)dh / ci.extent.size.height;
-    ci = [ci imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
-
+    CVPixelBufferLockBaseAddress(pb, 0);
+    void  *base = CVPixelBufferGetBaseAddress(pb);
+    size_t bpr  = CVPixelBufferGetBytesPerRow(pb);
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    [ctx render:ci
-        toCVPixelBuffer:pb
-                 bounds:CGRectMake(0, 0, dw, dh)
-             colorSpace:cs];
+    CGContextRef ctx = CGBitmapContextCreate(base, dw, dh, 8, bpr, cs,
+                                             kCGImageAlphaPremultipliedFirst |
+                                             kCGBitmapByteOrder32Little);
+    if (!ctx) {
+        CGColorSpaceRelease(cs);
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+        CVPixelBufferRelease(pb);
+        return NULL;
+    }
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)dw, (CGFloat)dh), cg);
+    CGContextRelease(ctx);
     CGColorSpaceRelease(cs);
+    CVPixelBufferUnlockBaseAddress(pb, 0);
     return pb;
 }
 
@@ -573,7 +555,7 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     // Two queues on purpose: session configuration/start/stop and the sample
     // buffer callbacks must never share a queue.  startRunning() blocks, and
     // when it runs on the delegate queue the first frames are starved for as
-    // long as it takes — or for good, if the session then needs a teardown.
+    // long as it takes.
     dispatch_queue_t          _sessionQueue;
     dispatch_queue_t          _queue;
 
@@ -591,30 +573,31 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     NSTimer                  *_photoTimer;
 
     NSUInteger                _framesSeen;
-    NSUInteger                _framesAtStart;   // frames already seen when this rung began
+    NSUInteger                _framesAtStart;
     NSUInteger                _detectRuns;
     NSUInteger                _faceHits;
     NSUInteger                _bufW;
     NSUInteger                _bufH;
     NSUInteger                _dropsSeen;
-    NSUInteger                _photoShots;
-    NSUInteger                _attempt;      // current rung of the ladder
-    unsigned int              _chosenFmt;
-    NSString                 *_sourceNote;   // 源 视频420f / 照片 / 系统相机
-    NSString                 *_linkNote;     // conn/act/run state of the session
+    NSUInteger                _photoShots;    // stills that really arrived
+    NSUInteger                _photoFails;    // still captures that died
+    NSString                 *_sourceNote;    // 视频 / 照片 / 系统相机
+    NSString                 *_linkNote;      // session/connection state
     float                     _lastQuality;
 
     BOOL                      _finished;
     BOOL                      _cameraConfigured;
+    BOOL                      _building;
     BOOL                      _permissionResolved;
-    BOOL                      _photoMode;    // still-image session in use
+    BOOL                      _photoMode;     // still pump running
     BOOL                      _photoInFlight;
-    BOOL                      _manualMode;   // system camera UI in use
+    BOOL                      _manualMode;    // system camera UI in use
+    BOOL                      _pickerUp;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    FUSLog(@"enroll viewDidLoad (v2.2.0 capture ladder)");
+    FUSLog(@"enroll viewDidLoad (v2.3.0 single-session)");
     self.view.backgroundColor = [UIColor blackColor];
     _collected = [NSMutableArray array];
     _queue = dispatch_queue_create("com.ray835999.faceunlock.enroll", DISPATCH_QUEUE_SERIAL);
@@ -645,12 +628,12 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     _progressLabel.textAlignment = NSTextAlignmentCenter;
     [self.view addSubview:_progressLabel];
 
-    // Three lines of monospaced text. A screenshot of this block is the whole
+    // Three lines of monospaced text.  A screenshot of this block is the whole
     // diagnosis:
-    //   line 1  counters + which rung of the ladder is running
-    //   line 2  where the frames come from and in which pixel format
-    //   line 3  the session connection state + where detection stopped
-    _meterLabel = [self label:@"帧 0 · 检测 0 · 命中 0" size:10 weight:UIFontWeightRegular];
+    //   line 1  counters + where the frames come from
+    //   line 2  buffer size, dropped buffers, still-shutter counters
+    //   line 3  session state + where detection stopped
+    _meterLabel = [self label:@"帧 0 检测 0 命中 0" size:10 weight:UIFontWeightRegular];
     _meterLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
     _meterLabel.textColor = [UIColor colorWithWhite:0.72 alpha:1];
     _meterLabel.textAlignment = NSTextAlignmentCenter;
@@ -672,7 +655,7 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     // AVCaptureSession can, so enrollment is possible even when every
     // programmatic path fails.
     _manualButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_manualButton setTitle:@"系统相机拍照" forState:UIControlStateNormal];
+    [_manualButton setTitle:@"系统相机拍照 5 张" forState:UIControlStateNormal];
     [_manualButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     _manualButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     _manualButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
@@ -719,8 +702,7 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     CGFloat meterH = 62;
     CGFloat meterY = h - insets.bottom - 8 - meterH;
     // retry and the system-camera escape hatch share one row directly above
-    // the meter, so the block never collides with the guide circle on a 4"
-    // screen either
+    // the meter, so the block never collides with the guide circle
     CGFloat rowH = 44;
     CGFloat rowY = meterY - 8 - rowH;
 
@@ -736,7 +718,7 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    FUSLog(@"enroll viewDidAppear (manual=%d)", (int)_manualMode);
+    FUSLog(@"enroll viewDidAppear (manual=%d picker=%d)", (int)_manualMode, (int)_pickerUp);
     if (_manualMode) return;   // the picker dismisses/presents us repeatedly
     [self startCamera];
 }
@@ -750,7 +732,7 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
 #pragma mark - camera: authorization
 
 - (void)startCamera {
-    if (_cameraConfigured || _manualMode) return;
+    if (_cameraConfigured || _building || _manualMode) return;
 
     // If Vision itself is not usable in this process, say so immediately
     // instead of leaving the user staring at a live preview that can never
@@ -791,50 +773,33 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
                 if (!ss) return;
                 ss->_permissionResolved = YES;
                 FUSLog(@"permission granted=%d", (int)granted);
-                if (granted) [ss beginAttempt:0];
+                if (granted) [ss beginCapture];
                 else [ss failWith:@"需要相机权限才能录入人脸。\n请到 设置 → 隐私 → 相机 里允许 FaceUnlock。"];
             });
         }];
         return;
     }
-    [self beginAttempt:0];
+    [self beginCapture];
 }
 
-#pragma mark - camera: the video ladder
+#pragma mark - camera: the one session
 
-// Advance the ladder. Each rung is a brand-new session; the previous one is
-// torn down (and stopped on the session queue) before the next is built, so
-// the two never fight over the camera.
-- (void)beginAttempt:(NSUInteger)i {
-    if (_finished || _manualMode) return;
-    _attempt = i;
-
-    if (i >= kVideoAttempts) {          // video is dead -> stills
-        [self switchToPhotoMode];
-        return;
-    }
-
-    [self teardownSession];
-    // never reset _framesSeen: a frame from the previous rung could still be in
-    // flight, and a bogus 1 would make the watchdog think this rung works
-    _framesAtStart = _framesSeen;
-    OSType fmt  = FUSFormatForAttempt(i);
-    _chosenFmt  = fmt;
-    _sourceNote = [NSString stringWithFormat:@"视频 %@", FUSFormatName(fmt)];
+- (void)beginCapture {
+    if (_finished || _manualMode || _cameraConfigured || _building) return;
+    _building   = YES;
+    _sourceNote = @"视频 自动格式";
     _linkNote   = @"building";
-    [self setHint:[NSString stringWithFormat:
-        @"正在打开相机（第 %lu/%lu 种格式：%@）",
-        (unsigned long)(i + 1), (unsigned long)kVideoAttempts, FUSFormatName(fmt)]];
+    [self setHint:@"正在打开相机…"];
     [self publishMeter];
 
     __weak FUSEnrollViewController *weakSelf = self;
     dispatch_async(_sessionQueue, ^{
-        [weakSelf buildVideoSession:i];
+        [weakSelf buildCaptureSession];
     });
 }
 
 // runs on _sessionQueue
-- (void)buildVideoSession:(NSUInteger)i {
+- (void)buildCaptureSession {
     @autoreleasepool {
         @try {
             AVCaptureDeviceDiscoverySession *disc =
@@ -843,77 +808,76 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
                                           mediaType:AVMediaTypeVideo
                                            position:AVCaptureDevicePositionFront];
             AVCaptureDevice *cam = disc.devices.firstObject;
-            if (!cam) { [self uiFail:@"没有找到前置摄像头"]; return; }
+            if (!cam) { _building = NO; [self uiFail:@"没有找到前置摄像头"]; return; }
 
             NSError *err = nil;
             AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:cam error:&err];
             if (!input) {
+                _building = NO;
                 [self uiFail:[NSString stringWithFormat:@"打开摄像头失败：%@",
                               err.localizedDescription ?: @"未知错误"]];
                 return;
             }
 
-            OSType fmt = FUSFormatForAttempt(i);
             AVCaptureSession *session = [AVCaptureSession new];
-            AVCaptureVideoDataOutput *out = [AVCaptureVideoDataOutput new];
-            out.alwaysDiscardsLateVideoFrames = YES;
-            // RULE 1: videoSettings BEFORE addOutput:. Applying it to an output
-            // that is already part of a committed session is not honoured by
-            // every AVFoundation build — the connection then stays mute while
-            // the preview keeps rendering.
-            out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(fmt) };
+            AVCaptureVideoDataOutput *video = [AVCaptureVideoDataOutput new];
+            video.alwaysDiscardsLateVideoFrames = YES;
+            // NO videoSettings on purpose — see the header comment.  Letting
+            // AVFoundation negotiate is the whole point of this rewrite.
+
+            AVCapturePhotoOutput *photo = [AVCapturePhotoOutput new];
+            @try {
+                if ([photo respondsToSelector:NSSelectorFromString(@"setHighResolutionCaptureEnabled:")]) {
+                    [photo setValue:@NO forKey:@"highResolutionCaptureEnabled"];
+                }
+            } @catch (NSException *e) {}
 
             [session beginConfiguration];
-            NSString *preset = FUSPresetForAttempt(i);
+            NSString *preset = AVCaptureSessionPreset640x480;
             if ([session canSetSessionPreset:preset]) session.sessionPreset = preset;
             if (![session canAddInput:input]) {
                 [session commitConfiguration];
+                _building = NO;
                 [self uiFail:@"无法添加相机输入"];
                 return;
             }
             [session addInput:input];
-            if (![session canAddOutput:out]) {
+            if (![session canAddOutput:video]) {
                 [session commitConfiguration];
+                _building = NO;
                 [self uiFail:@"无法添加视频输出"];
                 return;
             }
-            [session addOutput:out];
+            [session addOutput:video];
+            BOOL photoAdded = NO;
+            if ([session canAddOutput:photo]) {
+                [session addOutput:photo];
+                photoAdded = YES;
+            }
             [session commitConfiguration];
 
-            [out setSampleBufferDelegate:self queue:_queue];
+            [video setSampleBufferDelegate:self queue:_queue];
 
-            AVCaptureConnection *conn = [out connectionWithMediaType:AVMediaTypeVideo];
+            AVCaptureConnection *conn = [video connectionWithMediaType:AVMediaTypeVideo];
             if (conn) {
                 conn.enabled = YES;
                 if (conn.supportsVideoOrientation) {
                     conn.videoOrientation = AVCaptureVideoOrientationPortrait;
                 }
             }
-            NSArray *avail = out.availableVideoCVPixelFormatTypes;
-            BOOL listed = [avail containsObject:@(fmt)];
 
-            NSString *pname = session.sessionPreset ?: @"?";
-            pname = [pname stringByReplacingOccurrencesOfString:@"AVCaptureSessionPreset"
-                                                     withString:@""];
-            NSString *link = [NSString stringWithFormat:
-                @"out%lu conn%@ act%@ en%@ fmt%@%@",
-                (unsigned long)session.outputs.count,
-                conn ? @"1" : @"0",
-                (conn && conn.isActive) ? @"1" : @"0",
-                (conn && conn.enabled)  ? @"1" : @"0",
-                listed ? @"!" : @"?",
-                pname];
-            FUSLog(@"attempt %lu: fmt=%@ preset=%@ avail=%@ %@",
-                   (unsigned long)i, FUSFormatName(fmt), session.sessionPreset, avail, link);
-
-            _session = session;
-            _output  = out;
-            _photoOut = nil;
-            _linkNote = link;
+            _session  = session;
+            _output   = video;
+            _photoOut = photoAdded ? photo : nil;
+            _linkNote = [NSString stringWithFormat:@"out%lu vid%@ photo%@",
+                         (unsigned long)session.outputs.count,
+                         conn ? @"1" : @"0", photoAdded ? @"1" : @"0"];
+            FUSLog(@"capture session built: %@ preset=%@", _linkNote, session.sessionPreset);
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 self->_preview.session = session;
                 self->_cameraConfigured = YES;
+                self->_building = NO;
                 self->_retryButton.hidden = YES;
                 self->_hintLabel.text = @"把脸放进圆圈里，保持不动";
                 [self publishMeter];
@@ -922,29 +886,37 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
             // already on the session queue: startRunning may block here freely
             @try { [session startRunning]; }
             @catch (NSException *e) { FUSLog(@"startRunning: %@", e.reason); }
-            FUSLog(@"attempt %lu isRunning=%d inter=%d", (unsigned long)i,
-                   (int)session.isRunning, (int)session.isInterrupted);
 
-            AVCaptureConnection *c2 = [out connectionWithMediaType:AVMediaTypeVideo];
-            _linkNote = [NSString stringWithFormat:@"run%@ act%@ en%@",
+            AVCaptureConnection *c2 = [video connectionWithMediaType:AVMediaTypeVideo];
+            _linkNote = [NSString stringWithFormat:@"run%@ act%@ en%@ photo%@",
                          session.isRunning ? @"1" : @"0",
                          (c2 && c2.isActive) ? @"1" : @"0",
-                         (c2 && c2.enabled)  ? @"1" : @"0"];
+                         (c2 && c2.enabled)  ? @"1" : @"0",
+                         photoAdded ? @"1" : @"0"];
+            FUSLog(@"startRunning done: %@", _linkNote);
 
-            // RULE 3: no frame in 2 s -> next rung, automatically.
-            NSUInteger rung = i;
+            NSUInteger framesAtStart = _framesSeen;
             __weak FUSEnrollViewController *weakSelf = self;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 FUSEnrollViewController *ss = weakSelf;
                 if (!ss || ss->_finished || ss->_manualMode) return;
-                if (ss->_attempt != rung) return;
-                if (ss->_framesSeen > ss->_framesAtStart) return;
-                FUSLog(@"attempt %lu delivered 0 frames -> next candidate", (unsigned long)rung);
-                [ss beginAttempt:rung + 1];
+                if (ss->_framesSeen > framesAtStart) return;   // video works, done
+                FUSLog(@"no video frame in 1.5s -> still pump on the SAME session");
+                [ss startPhotoPump];
+
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    FUSEnrollViewController *s2 = weakSelf;
+                    if (!s2 || s2->_finished || s2->_manualMode) return;
+                    if (s2->_framesSeen > framesAtStart) return;
+                    FUSLog(@"still pump produced nothing either -> system camera");
+                    [s2 uiManualOnly];
+                });
             });
         } @catch (NSException *e) {
-            FUSLog(@"buildVideoSession exception: %@", e.reason);
+            _building = NO;
+            FUSLog(@"buildCaptureSession exception: %@", e.reason);
             [self uiFail:[NSString stringWithFormat:@"相机初始化异常：%@", e.reason ?: @"?"]];
         }
     }
@@ -954,136 +926,97 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     dispatch_async(dispatch_get_main_queue(), ^{ [self failWith:msg]; });
 }
 
-- (void)teardownSession {
+// Stop the session, and only then run `done`.  Used before the system camera
+// UI opens: the picker needs the device, and it must not be handed a camera
+// that is still being released.
+- (void)teardownSessionThen:(void (^)(void))done {
     AVCaptureSession *s = _session;
     _session = nil;
     _output  = nil;
     _photoOut = nil;
     _cameraConfigured = NO;
     _photoInFlight = NO;
-    if (s) {
-        // stopRunning blocks as well: same serial queue as startRunning, so it
-        // is ordered behind whatever the previous rung was doing
-        dispatch_async(_sessionQueue, ^{
+    _photoMode = NO;
+    _building = NO;
+
+    void (^after)(void) = ^{ if (done) done(); };
+    if (!s) { after(); return; }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_preview.session == s) self->_preview.session = nil;
+        dispatch_async(self->_sessionQueue, ^{
             @autoreleasepool {
                 @try { [s stopRunning]; } @catch (NSException *e) {}
             }
+            dispatch_async(dispatch_get_main_queue(), after);
         });
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self->_preview.session == s) self->_preview.session = nil;
     });
 }
 
-#pragma mark - camera: still-photo rung
+#pragma mark - camera: stills from the same session
 
-// The streamed buffers never came. Stills go through a different path inside
-// AVFoundation (on-demand capture rather than a continuous tap), so they work
-// in setups where the stream is mute. Its own session, preview + photo output
-// only — no competing video data output.
-- (void)switchToPhotoMode {
-    if (_photoMode || _finished || _manualMode) return;
-    _photoMode = YES;
-    _framesAtStart = _framesSeen;
-    _photoShots = 0;
+- (void)startPhotoPump {
+    if (_photoTimer || _finished || _manualMode) return;
+    if (!_photoOut) { [self uiManualOnly]; return; }
+    _photoMode  = YES;
+    _photoFails = 0;
     _sourceNote = @"照片";
-    _linkNote   = @"building";
-    [self setHint:@"视频流取不到帧，已改用拍照识别…"];
+    [self setHint:@"视频流没出帧，改用同一路相机连拍识别…"];
     [self publishMeter];
 
-    // the video session must be gone before the still session starts, or the
-    // two will fight over the camera
-    [self teardownSession];
-
-    __weak FUSEnrollViewController *weakSelf = self;
-    dispatch_async(_sessionQueue, ^{
-        @autoreleasepool {
-            @try {
-                AVCaptureDeviceDiscoverySession *disc =
-                    [AVCaptureDeviceDiscoverySession
-                        discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
-                                              mediaType:AVMediaTypeVideo
-                                               position:AVCaptureDevicePositionFront];
-                AVCaptureDevice *cam = disc.devices.firstObject;
-                NSError *err = nil;
-                AVCaptureDeviceInput *input = cam ? [AVCaptureDeviceInput deviceInputWithDevice:cam
-                                                                                         error:&err] : nil;
-                AVCaptureSession *session = [AVCaptureSession new];
-                AVCapturePhotoOutput *photoOut = [AVCapturePhotoOutput new];
-
-                [session beginConfiguration];
-                if ([session canSetSessionPreset:AVCaptureSessionPreset640x480]) {
-                    session.sessionPreset = AVCaptureSessionPreset640x480;
-                }
-                if (!input || ![session canAddInput:input]) {
-                    [session commitConfiguration];
-                    [self uiFail:@"拍照模式也拿不到相机"];
-                    return;
-                }
-                [session addInput:input];
-                if (![session canAddOutput:photoOut]) {
-                    [session commitConfiguration];
-                    FUSLog(@"photo output rejected -> manual camera only");
-                    [self uiManualOnly];
-                    return;
-                }
-                [session addOutput:photoOut];
-                [session commitConfiguration];
-
-                self->_session = session;
-                self->_photoOut = photoOut;
-                self->_output = nil;
-                self->_linkNote = @"photo session";
-
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    self->_preview.session = session;
-                    self->_cameraConfigured = YES;
-                    self->_hintLabel.text = @"正在拍照识别…";
-                    [self publishMeter];
-                });
-
-                @try { [session startRunning]; }
-                @catch (NSException *e) { FUSLog(@"photo startRunning: %@", e.reason); }
-
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    FUSEnrollViewController *ss = weakSelf;
-                    if (!ss || ss->_finished) return;
-                    [ss->_photoTimer invalidate];
-                    ss->_photoTimer = [NSTimer scheduledTimerWithTimeInterval:0.9
-                                                                      target:ss
-                                                                    selector:@selector(capturePhotoTick)
-                                                                    userInfo:nil
-                                                                     repeats:YES];
-                    [ss capturePhotoTick];
-
-                    // no still either -> hand over to the system camera UI
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        FUSEnrollViewController *ss2 = weakSelf;
-                        if (!ss2 || ss2->_finished || ss2->_manualMode) return;
-                        if (ss2->_photoShots > 0) return;
-                        FUSLog(@"photo mode produced no still -> manual camera");
-                        [ss2 uiManualOnly];
-                        [ss2 manualTapped:nil];
-                    });
-                });
-            } @catch (NSException *e) {
-                FUSLog(@"switchToPhotoMode: %@", e.reason);
-                [self uiManualOnly];
-            }
-        }
-    });
+    _photoTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                  target:self
+                                                selector:@selector(pumpTick)
+                                                userInfo:nil
+                                                 repeats:YES];
+    _photoTimer.tolerance = 0.2;
+    [self pumpTick];
 }
 
-- (void)capturePhotoTick {
-    if (_finished || _photoInFlight || !_photoOut) return;
-    if (!_session.isRunning) return;
-    _photoInFlight = YES;
+- (void)stopPhotoPump {
+    void (^b)(void) = ^{
+        [self->_photoTimer invalidate];
+        self->_photoTimer  = nil;
+        self->_photoMode   = NO;
+        self->_photoInFlight = NO;
+    };
+    if ([NSThread isMainThread]) b(); else dispatch_async(dispatch_get_main_queue(), b);
+}
+
+// main thread
+- (void)pumpTick {
+    if (_finished || _manualMode) { [self stopPhotoPump]; return; }
+    if (_photoInFlight) return;
+    if (!_session || !_session.isRunning) return;
+    [self takeStill];
+}
+
+- (void)takeStill {
+    if (!_photoOut || _photoInFlight) return;
     @try {
-        AVCapturePhotoSettings *settings = [AVCapturePhotoSettings photoSettings];
-        [_photoOut capturePhotoWithSettings:settings delegate:self];
+        AVCapturePhotoSettings *st = [AVCapturePhotoSettings photoSettings];
+        @try {
+            // 1 == Speed; KVC keeps this safe on SDKs without the property
+            [st setValue:@1 forKey:@"photoQualityPrioritization"];
+        } @catch (NSException *e) {}
+        _photoInFlight = YES;
+        [_photoOut capturePhotoWithSettings:st delegate:self];
+
+        __weak FUSEnrollViewController *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            FUSEnrollViewController *ss = weakSelf;
+            if (!ss || !ss->_photoInFlight) return;
+            ss->_photoInFlight = NO;      // the shutter never called back
+            ss->_photoFails++;
+            FUSLog(@"still %lu never called back (fails %lu)",
+                   (unsigned long)ss->_photoShots, (unsigned long)ss->_photoFails);
+            [ss publishMeter];
+            if (ss->_photoFails >= 3) [ss uiManualOnly];
+        });
     } @catch (NSException *e) {
         _photoInFlight = NO;
+        _photoFails++;
         FUSLog(@"capturePhoto exception: %@", e.reason);
     }
 }
@@ -1091,84 +1024,157 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
 #pragma mark - camera: system UI (cannot fail)
 
 - (void)uiManualOnly {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self->_photoTimer invalidate];
-        self->_photoTimer = nil;
+    void (^b)(void) = ^{
+        if (self->_finished || self->_manualMode) return;
+        [self stopPhotoPump];
         self->_manualButton.hidden = NO;
-        [self setHint:@"自动取帧不可用\n请用最下面的按钮调系统相机拍 5 张"];
-    });
+        self->_manualButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
+        [self->_manualButton setTitle:@"点这里：系统相机拍 5 张" forState:UIControlStateNormal];
+        self->_hintLabel.text = @"这台设备上自动取帧拿不到画面\n请点最下面蓝色的按钮，用系统相机拍 5 张";
+        [self publishMeter];
+    };
+    if ([NSThread isMainThread]) b(); else dispatch_async(dispatch_get_main_queue(), b);
 }
 
 - (void)manualTapped:(UIButton *)b {
     if (_finished) return;
+    if (_pickerUp) return;
     if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeCamera]) {
         [self failWith:@"这台设备没有可用的相机 UI"];
         return;
     }
+    FUSLog(@"manual tapped (collected %lu)", (unsigned long)_collected.count);
     _manualMode = YES;
+    _manualButton.hidden = NO;
     _sourceNote = @"系统相机";
     _linkNote   = @"system UI";
-    [self->_photoTimer invalidate];
-    _photoTimer = nil;
-    [self teardownSession];
+    [self stopPhotoPump];
     [self publishMeter];
+    [self setHint:@"正在打开系统相机…"];
 
+    // the system camera can only open once our session has released the device
+    __weak FUSEnrollViewController *weakSelf = self;
+    [self teardownSessionThen:^{
+        [weakSelf presentSystemCamera];
+    }];
+}
+
+- (void)presentSystemCamera {
+    if (_finished) { _manualMode = NO; return; }
+    if (_pickerUp) return;
+    if (!self.view.window) {
+        FUSLog(@"enroll view is not in a window, cannot present the picker");
+        _manualMode = NO;
+        [self setHint:@"页面已经不在前台，无法打开系统相机"];
+        return;
+    }
+    if (self.presentedViewController) {
+        FUSLog(@"already presenting %@", self.presentedViewController);
+        _pickerUp = NO;
+        return;
+    }
+    _pickerUp = YES;
     UIImagePickerController *p = [UIImagePickerController new];
-    p.sourceType = UIImagePickerControllerSourceTypeCamera;
+    p.sourceType   = UIImagePickerControllerSourceTypeCamera;
     p.cameraDevice = UIImagePickerControllerCameraDeviceFront;
     p.allowsEditing = NO;
     p.delegate = self;
-    [self presentViewController:p animated:YES completion:nil];
+    FUSLog(@"presenting the system camera");
+    [self presentViewController:p animated:YES completion:^{
+        FUSLog(@"system camera is up");
+    }];
 }
 
 - (void)imagePickerController:(UIImagePickerController *)picker
 didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
     UIImage *img = info[UIImagePickerControllerOriginalImage];
-    [picker dismissViewControllerAnimated:YES completion:nil];
-    FUSLog(@"system camera returned image %@", img ? NSStringFromCGSize(img.size) : @"nil");
+    _pickerUp = NO;
+    FUSLog(@"system camera returned %@ image",
+           [img isKindOfClass:[UIImage class]] ? NSStringFromCGSize(img.size) : @"nil");
 
-    if ([img isKindOfClass:[UIImage class]]) {
-        CVPixelBufferRef pb = FUSPixelBufferFromImage(img);
-        if (pb) {
-            dispatch_async(_queue, ^{
-                @autoreleasepool {
-                    self->_lastCapture = nil;      // manual shots are never "too soon"
-                    self->_framesSeen++;
-                    [self processPixelBuffer:pb];
-                    CVPixelBufferRelease(pb);
-                }
-            });
-        } else {
-            FUSLog(@"could not convert the still to a pixel buffer");
-        }
-    }
-
-    // keep shooting until 5 samples are in
     __weak FUSEnrollViewController *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    [picker dismissViewControllerAnimated:YES completion:^{
         FUSEnrollViewController *ss = weakSelf;
         if (!ss || ss->_finished) return;
+        [ss handleManualImage:img];
+    }];
+}
+
+- (void)handleManualImage:(UIImage *)img {
+    if (_finished) return;
+    if (![img isKindOfClass:[UIImage class]]) {
+        [self setHint:@"系统相机没有返回照片\n请再拍一次"];
+        [self rearmManual];
+        return;
+    }
+    _sourceNote = @"系统相机";
+    [self setHint:@"收到照片，正在识别…"];
+    [self publishMeter];
+
+    CVPixelBufferRef pb = FUSPixelBufferFromImage(img);
+    if (!pb) {
+        FUSLog(@"could not convert the still to a pixel buffer");
+        [self setHint:@"这张照片转换失败\n请再拍一次（正对镜头、光线亮一点）"];
+        [self rearmManual];
+        return;
+    }
+
+    __weak FUSEnrollViewController *weakSelf = self;
+    dispatch_async(_queue, ^{
+        @autoreleasepool {
+            FUSEnrollViewController *ss = weakSelf;
+            if (!ss) { CVPixelBufferRelease(pb); return; }
+            ss->_lastCapture = nil;          // manual shots are never "too soon"
+            ss->_framesSeen++;
+            [ss processPixelBuffer:pb];
+            CVPixelBufferRelease(pb);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                FUSEnrollViewController *s2 = weakSelf;
+                if (!s2 || s2->_finished) return;
+                if (s2->_collected.count < kSamples) [s2 rearmManual];
+            });
+        }
+    });
+}
+
+// Wait for the processing pass to report, then shoot the next one.
+- (void)rearmManual {
+    if (_finished || !_manualMode) return;
+    __weak FUSEnrollViewController *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss || ss->_finished || !ss->_manualMode) return;
         if (ss->_collected.count >= kSamples) return;
-        [ss manualTapped:nil];
+        [ss presentSystemCamera];
     });
 }
 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-    _manualMode = NO;
-    [self setHint:@"已取消系统相机\n可以点「重试打开相机」再试一次自动识别"];
+    _pickerUp = NO;
+    __weak FUSEnrollViewController *weakSelf = self;
+    // _manualMode drops only after the dismissal finishes, so the
+    // viewDidAppear that this dismissal triggers does not silently restart the
+    // capture session underneath the animation.
+    [picker dismissViewControllerAnimated:YES completion:^{
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss || ss->_finished) return;
+        ss->_manualMode = NO;
+        ss->_retryButton.hidden = NO;
+        [ss setHint:[NSString stringWithFormat:
+            @"已取消系统相机 · 已采集 %lu/%lu\n点「系统相机拍照」再来，或点「重试打开相机」",
+            (unsigned long)ss->_collected.count, (unsigned long)kSamples]];
+    }];
 }
 
 - (void)stopCamera {
-    if (_photoTimer) { [_photoTimer invalidate]; _photoTimer = nil; }
-    _photoMode = NO;
-    _photoInFlight = NO;
-    [self teardownSession];
+    [self stopPhotoPump];
+    [self teardownSessionThen:nil];
 }
 
 - (void)failWith:(NSString *)msg {
     FUSLog(@"enroll failure: %@", msg);
+    _building = NO;
     _hintLabel.text = msg;
     _retryButton.hidden = NO;
     _manualButton.hidden = NO;
@@ -1176,26 +1182,57 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
 
 - (void)retryTapped:(UIButton *)b {
     FUSLog(@"retry tapped");
-    [self stopCamera];
+    [self stopPhotoPump];
     _manualMode = NO;
-    _finished = NO;
-    _photoMode = NO;
+    _pickerUp   = NO;
+    _finished   = NO;
+    _photoMode  = NO;
+    _photoFails = 0;
+    _photoShots = 0;
+    _framesSeen = 0;
+    _framesAtStart = 0;
+    _detectRuns = 0;
+    _faceHits   = 0;
+    _dropsSeen  = 0;
+    _lastCapture = nil;
+    _sourceNote = @"等待相机";
+    _linkNote   = @"-";
     [_collected removeAllObjects];
     _progressLabel.text = @"0 / 5";
     _retryButton.hidden = YES;
+    _manualButton.hidden = NO;
     _hintLabel.text = @"正在重试…";
+
     __weak FUSEnrollViewController *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    [self teardownSessionThen:^{
         [weakSelf startCamera];
-    });
+    }];
 }
 
 - (void)cancelTapped:(UIButton *)b {
-    FUSLog(@"cancel tapped");
+    FUSLog(@"cancel tapped (collected %lu)", (unsigned long)_collected.count);
+    if (_collected.count > 0 && _collected.count < kSamples) {
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"还没录完"
+                             message:[NSString stringWithFormat:
+                                 @"已经采集 %lu/%lu，现在退出不会保存。",
+                                 (unsigned long)_collected.count, (unsigned long)kSamples]
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"继续录入" style:UIAlertActionStyleCancel handler:nil]];
+        __weak FUSEnrollViewController *weakSelf = self;
+        [a addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *x) { [weakSelf dismissSelf]; }]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    [self dismissSelf];
+}
+
+- (void)dismissSelf {
     _manualMode = NO;
+    _pickerUp   = NO;
+    _finished   = YES;      // stop every pending callback from touching the UI
     [self stopCamera];
-    // dismissing self also removes the picker if it is up
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
@@ -1213,15 +1250,14 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
     _lastMeter = now;
 
     NSString *line1 = [NSString stringWithFormat:
-        @"帧 %lu 检测 %lu 命中 %lu  第%lu档",
+        @"帧 %lu 检测 %lu 命中 %lu · %@",
         (unsigned long)_framesSeen, (unsigned long)_detectRuns,
-        (unsigned long)_faceHits, (unsigned long)(_attempt + 1)];
+        (unsigned long)_faceHits, _sourceNote ?: @"-"];
     NSString *line2 = [NSString stringWithFormat:
-        @"源 %@  %lux%lu 丢%lu",
-        _sourceNote ?: @"-", (unsigned long)_bufW, (unsigned long)_bufH,
-        (unsigned long)_dropsSeen];
-    NSString *line3 = [NSString stringWithFormat:
-        @"%@ · %@",
+        @"%lux%lu 丢%lu 快门%lu 失败%lu",
+        (unsigned long)_bufW, (unsigned long)_bufH, (unsigned long)_dropsSeen,
+        (unsigned long)_photoShots, (unsigned long)_photoFails];
+    NSString *line3 = [NSString stringWithFormat:@"%@ · %@",
         _linkNote ?: @"-", [FacePrint lastDetectNote] ?: @"-"];
     NSString *text = [NSString stringWithFormat:@"%@\n%@\n%@", line1, line2, line3];
 
@@ -1238,7 +1274,12 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         // "no buffer arrived at all" must never look the same on screen
         _framesSeen++;
         if (_framesSeen == 1) {
-            FUSLog(@"first video frame arrived (fmt %@) - stream is alive", FUSFormatName(_chosenFmt));
+            FUSLog(@"first video frame arrived - the stream is alive, still pump off");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self stopPhotoPump];
+                self->_sourceNote = @"视频";
+                [self publishMeter];
+            });
         }
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (!pb) return;
@@ -1247,8 +1288,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 }
 
 // Delegate too slow / starved: AVFoundation reports discarded buffers here.
-// A non-zero count proves the camera IS producing frames, which is the only way
-// to tell "no frames at all" apart from "frames dropped before reaching us".
 - (void)captureOutput:(AVCaptureOutput *)output
 didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
@@ -1259,31 +1298,64 @@ didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 }
 
-// Still-capture path, used when the streamed buffers never arrive.
 - (void)photoOutput:(AVCapturePhotoOutput *)output
 didFinishProcessingPhoto:(AVCapturePhoto *)photo
               error:(NSError *)error {
     _photoInFlight = NO;
     if (error) {
-        FUSLog(@"photo error: %@", error.localizedDescription ?: @"?");
+        _photoFails++;
+        FUSLog(@"still error: %@", error.localizedDescription ?: @"?");
+        [self publishMeter];
+        if (_photoFails >= 3) [self uiManualOnly];
         return;
     }
+
     CVPixelBufferRef pb = photo.pixelBuffer;
-    if (!pb) { FUSLog(@"photo has no pixel buffer"); return; }
-    _photoShots++;          // a still really arrived: keeps the fallback armed
-    CVPixelBufferRetain(pb);
+    if (pb) {
+        _photoShots++;
+        _photoFails = 0;
+        CVPixelBufferRetain(pb);
+        __weak FUSEnrollViewController *weakSelf = self;
+        dispatch_async(_queue, ^{
+            @autoreleasepool {
+                FUSEnrollViewController *ss = weakSelf;
+                if (!ss) { CVPixelBufferRelease(pb); return; }
+                ss->_framesSeen++;
+                [ss processPixelBuffer:pb];
+                CVPixelBufferRelease(pb);
+            }
+        });
+        return;
+    }
+
+    // processed stills (JPEG) carry no pixel buffer — decode the file instead
+    NSData *d = photo.fileDataRepresentation;
+    UIImage *img = d ? [UIImage imageWithData:d] : nil;
+    CVPixelBufferRef pb2 = img ? FUSPixelBufferFromImage(img) : NULL;
+    if (!pb2) {
+        _photoFails++;
+        FUSLog(@"still had neither a pixel buffer nor decodable data (fails %lu)",
+               (unsigned long)_photoFails);
+        [self publishMeter];
+        if (_photoFails >= 3) [self uiManualOnly];
+        return;
+    }
+    _photoShots++;
+    _photoFails = 0;
+    __weak FUSEnrollViewController *weakSelf2 = self;
     dispatch_async(_queue, ^{
         @autoreleasepool {
-            self->_framesSeen++;
-            [self processPixelBuffer:pb];
-            CVPixelBufferRelease(pb);
+            FUSEnrollViewController *ss = weakSelf2;
+            if (!ss) { CVPixelBufferRelease(pb2); return; }
+            ss->_framesSeen++;
+            [ss processPixelBuffer:pb2];
+            CVPixelBufferRelease(pb2);
         }
     });
 }
 
 // Runs on _queue (serial) for every frame source (video / still / system
-// camera), so the sampling logic is shared and a late-arriving video stream
-// cannot interleave with photo stills.
+// camera), so the sampling logic is shared and two sources cannot interleave.
 - (void)processPixelBuffer:(CVPixelBufferRef)pb {
     @try {
         if (_finished || _collected.count >= kSamples) return;
@@ -1309,7 +1381,7 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
 
         float q = -1.0f;
         // qualityGate:NO on purpose — a mediocre-quality face must still be
-        // enrollable. The tweak uses the same setting, so both sides accept
+        // enrollable.  The tweak uses the same setting, so both sides accept
         // the same faces and their prints stay comparable.
         VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb
                                                          qualityGate:NO
@@ -1362,7 +1434,14 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
 
 - (void)finish {
     FUSLog(@"finish: saving %lu templates", (unsigned long)_collected.count);
+    // dismiss any picker still on screen before the save-alert goes up
+    if (self.presentedViewController) {
+        [self.presentedViewController dismissViewControllerAnimated:NO completion:nil];
+    }
+    _pickerUp = NO;
+    _manualMode = NO;
     [self stopCamera];
+
     BOOL ok = [FacePrint saveTemplates:_collected];
     FUSLog(@"saveTemplates -> %d", (int)ok);
     if (!ok) {

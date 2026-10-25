@@ -1,4 +1,4 @@
-# FaceUnlock 2.2.0 — 摄像头人脸解锁（iPhone 6s / iOS 15 rootless）
+# FaceUnlock 2.3.0 — 摄像头人脸解锁（iPhone 6s / iOS 15 rootless）
 
 用**前置摄像头 + Vision 人脸特征指纹**在越狱的 Touch ID 机型上实现人脸解锁，
 是 Vizage（foxfortmobile，$3.99）的免费自建平替。
@@ -12,6 +12,43 @@
 | **FaceUnlock.dylib**（SpringBoard 插件） | 锁屏匹配 + 解锁，无 UI |
 
 录入和匹配跑的是**同一份 `FacePrint.m`**，两边特征指纹可直接比对。
+
+---
+
+## 2.3.0 修的是什么（"录入闪一下像崩了、系统相机拍完没反应、点取消就没了"）
+
+三个症状，三个各自独立的真凶，都在采集层：
+
+| 症状 | 真凶 |
+|---|---|
+| 一进录入页**闪一下、像崩了** | 2.2.0 的四档"格式阶梯"每档都**拆掉会话重建**，每次重建都要摘掉预览层再 `startRunning` —— 屏幕上是黑一下、亮一下、再黑一下。拆到一半的会话还会让下一次 `startRunning` 未必成功 |
+| **系统相机拍完没反应** | 打开系统相机前只做了**异步** `stopRunning`，picker 就在会话还没真释放摄像头时被弹出来 —— 苹果自己的相机拿不到设备，按快门等于按在空气上 |
+| **点取消就没了** | 取消后直接落到黑屏，没有任何提示和退路 |
+
+这一版改成 **一个会话、两个帧源、零会话重建**：
+
+| 改动 | 为什么 |
+|---|---|
+| `AVCaptureVideoDataOutput` **完全不设 `videoSettings`** | 强制像素格式正是让连接哑掉的原因。交给 AVFoundation 自己协商，摄像头才肯出帧。`FacePrint` 走 CIImage/Vision，本来就不关心格式 |
+| 没有阶梯，**一次建好就用** | 不再拆会话 = 不再闪。预览层全程只挂一个 session |
+| 视频没帧 → **同一个会话**用 `AVCapturePhotoOutput` 连拍（1 张/秒） | 不拆会话、不抢设备、不重建。拍照走的是 ISP 的静态通路，跟视频通路的哑不哑无关 |
+| 系统相机**等会话真的停了**才弹 | `teardownSessionThen:` 把 stop 做完再 present，苹果相机一定能拿到摄像头 |
+| 每拍一张都有**屏内回执** | "收到照片，正在识别…" → "很好，稍微换个角度" / "没检测到人脸…"。不会再出现"点了没反应" |
+| 取消要给**明确去处** | 弹提示写清"已采集 N/5"，并提示点「系统相机拍照」或「重试打开相机」 |
+
+底部计量仍是三行，一眼定位：
+
+```
+帧 128 检测 12 命中 11 · 视频
+640x480 丢0 快门0 失败0
+run1 act1 en1 photo1 · rect: 1 face(s) (orient right)
+```
+
+第二行的 `快门/失败` 是静态通路的计数器：`快门>0` 说明拍照通路活着，
+`失败` 连涨 3 次会自动把「系统相机拍照」按钮点亮。
+
+插件侧只做**一处**最小改动：阶梯第 0 档改成"不设 `videoSettings`"（`default(0)`），
+后面两档才是显式的 `420f`/`420v`。原来 3 秒无帧先换格式、全败才计崩溃计数的逻辑不变。
 
 ---
 
@@ -157,7 +194,7 @@ Vision 640x480 丢0 方向right · rect: 1 face(s)
 
 ## 使用方法
 
-1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_2.2.0-1+debug_iphoneos-arm64.deb`。
+1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_2.3.0-1+debug_iphoneos-arm64.deb`。
 2. 传到手机（Filza / SSH），Sileo / Zebra 安装或 `dpkg -i`（rootless 自动装到 `/var/jb`）。
    安装脚本会自动 `uicache`，桌面出现 **FaceUnlock** 图标。
 3. **先设好锁屏密码**（和 Vizage 一样的前提）。
