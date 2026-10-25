@@ -214,7 +214,7 @@ static void FULoadFrameworksOnce(void) {
         void *av = dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
         void *cv = dlopen("/System/Library/Frameworks/CoreVideo.framework/CoreVideo", RTLD_LAZY);
         void *vi = dlopen("/System/Library/Frameworks/Vision.framework/Vision", RTLD_LAZY);
-        FU_LOG("dlopen AVFoundation=%s CoreVideo=%s Vision=%s",
+        FU_LOG(@"dlopen AVFoundation=%s CoreVideo=%s Vision=%s",
                av ? "ok" : "FAIL", cv ? "ok" : "FAIL", vi ? "ok" : "FAIL");
         gAVOK = (FUClass(@"AVCaptureSession") != Nil &&
                  FUClass(@"AVCaptureDevice") != Nil &&
@@ -224,10 +224,10 @@ static void FULoadFrameworksOnce(void) {
         gVisionOK = [FacePrint visionAvailable];
         FUStatusSet(@"avOK", @(gAVOK));
         FUStatusSet(@"visionOK", @(gVisionOK));
-        if (!gAVOK)     FU_LOG("AVFoundation classes unavailable in SpringBoard");
-        if (!gVisionOK) FU_LOG("Vision unavailable in SpringBoard");
+        if (!gAVOK)     FU_LOG(@"AVFoundation classes unavailable in SpringBoard");
+        if (!gVisionOK) FU_LOG(@"Vision unavailable in SpringBoard");
     } @catch (NSException *e) {
-        FU_LOG("framework load exception: %@", e.reason);
+        FU_LOG(@"framework load exception: %@", e.reason);
         gAVOK = NO; gVisionOK = NO;
     }
 }
@@ -345,7 +345,7 @@ static float FUPrefFloat(NSString *key, float def) {
         BOOL killed = FUKillSwitch();
         FUStatusSet(@"killSwitch", @(killed));
         if (killed) {
-            FU_LOG("kill switch present - standing down (delete %@/DISABLED to re-enable)",
+            FU_LOG(@"kill switch present - standing down (delete %@/DISABLED to re-enable)",
                    FU_DIR);
             FUStatusSet(@"state", @"disabled (kill switch)");
             FUStatusFlush(YES);
@@ -367,15 +367,15 @@ static float FUPrefFloat(NSString *key, float def) {
                                  dispatch_get_main_queue(), ^(int t) {
             @autoreleasepool {
                 @try { [[FaceUnlockManager shared] noteDeviceLocked]; }
-                @catch (NSException *e) { FU_LOG("lockcomplete handler: %@", e.reason); }
+                @catch (NSException *e) { FU_LOG(@"lockcomplete handler: %@", e.reason); }
             }
         });
-        FU_LOG("ready: enabled=%d threshold=%.2f templates=%lu passcodeSet=%d killSwitch=0",
+        FU_LOG(@"ready: enabled=%d threshold=%.2f templates=%lu passcodeSet=%d killSwitch=0",
                self.enabled, self.threshold, (unsigned long)[self templateCount], _passcodeSet);
         FUStatusSet(@"ready", @YES);
         FUStatusFlush(YES);
     } @catch (NSException *e) {
-        FU_LOG("start exception: %@", e.reason);
+        FU_LOG(@"start exception: %@", e.reason);
     }
 }
 
@@ -388,9 +388,9 @@ static float FUPrefFloat(NSString *key, float def) {
         NSArray *t = [FacePrint loadTemplates];
         @synchronized (_tplLock) { _templates = t ?: @[]; }
         FUStatusSet(@"templates", @([self templateCount]));
-        FU_LOG("templates loaded: %lu", (unsigned long)[self templateCount]);
+        FU_LOG(@"templates loaded: %lu", (unsigned long)[self templateCount]);
     } @catch (NSException *e) {
-        FU_LOG("reloadTemplates: %@", e.reason);
+        FU_LOG(@"reloadTemplates: %@", e.reason);
     }
 }
 
@@ -401,7 +401,7 @@ static float FUPrefFloat(NSString *key, float def) {
         FUStatusSet(@"lockScreenVC", vc ? NSStringFromClass([vc class]) : @"none");
         [self noteDeviceLocked];
     } @catch (NSException *e) {
-        FU_LOG("noteLockScreenAppeared: %@", e.reason);
+        FU_LOG(@"noteLockScreenAppeared: %@", e.reason);
     }
 }
 
@@ -413,12 +413,12 @@ static float FUPrefFloat(NSString *key, float def) {
         if ([self templateCount] == 0) [self reloadTemplates];
         if ([self templateCount] == 0) {
             FUStatusSet(@"state", @"no templates - enroll in the FaceUnlock app");
-            FU_LOG("locked, but no templates enrolled");
+            FU_LOG(@"locked, but no templates enrolled");
             return;
         }
         [self startScanning];
     } @catch (NSException *e) {
-        FU_LOG("noteDeviceLocked: %@", e.reason);
+        FU_LOG(@"noteDeviceLocked: %@", e.reason);
     }
 }
 
@@ -431,7 +431,7 @@ static float FUPrefFloat(NSString *key, float def) {
         if (!gVisionOK){ FUStatusSet(@"state", @"no Vision"); return; }
         if (_passcodeSet == NO) {
             FUStatusSet(@"state", @"no passcode - nothing to unlock");
-            FU_LOG("no passcode set; face unlock is pointless");
+            FU_LOG(@"no passcode set; face unlock is pointless");
             return;
         }
         if ([self templateCount] == 0) return;
@@ -441,11 +441,11 @@ static float FUPrefFloat(NSString *key, float def) {
         NSUInteger gen = _gen;
         FUStatusSet(@"state", @"scanning");
         FUStatusAdd(@"sessions", 1);
-        FU_LOG("lock detected -> arming scan #%lu", (unsigned long)gen);
+        FU_LOG(@"lock detected -> arming scan #%lu", (unsigned long)gen);
 
         dispatch_async(_q, ^{ @autoreleasepool { [self runSessionGen:gen]; } });
     } @catch (NSException *e) {
-        FU_LOG("startScanning: %@", e.reason);
+        FU_LOG(@"startScanning: %@", e.reason);
         FUStatusSet(@"state", @"error starting");
     }
 }
@@ -464,7 +464,7 @@ static float FUPrefFloat(NSString *key, float def) {
             _session = nil;
         }
     } @catch (NSException *e) {
-        FU_LOG("teardown: %@", e.reason);
+        FU_LOG(@"teardown: %@", e.reason);
     }
     _deadline = nil;
 }
@@ -481,7 +481,7 @@ static float FUPrefFloat(NSString *key, float def) {
                         FUClass(@"AVCaptureDevice"),
                         @selector(authorizationStatusForMediaType:), @"vide");
                 FUStatusSet(@"cameraAuth", @(st));
-                FU_LOG("camera authorization: %ld (0=notDetermined 1=restricted 2=denied 3=authorized)",
+                FU_LOG(@"camera authorization: %ld (0=notDetermined 1=restricted 2=denied 3=authorized)",
                        (long)st);
             } @catch (NSException *e) {}
 
@@ -528,7 +528,7 @@ static float FUPrefFloat(NSString *key, float def) {
             _session     = session;
 
             [session startRunning];
-            FU_LOG("session started (gen %lu, window %.0fs)", (unsigned long)gen, kScanWindow);
+            FU_LOG(@"session started (gen %lu, window %.0fs)", (unsigned long)gen, kScanWindow);
 
             // watchdog: a session that never delivers frames is the classic
             // "phone is stuck holding the camera" case
@@ -538,14 +538,14 @@ static float FUPrefFloat(NSString *key, float def) {
                 @autoreleasepool {
                     if (gen != self->_runGen) return;
                     if (self->_frames > 0) return;
-                    FU_LOG("WATCHDOG: 0 frames in %.0fs - tearing the session down", kNoFrameTimeout);
+                    FU_LOG(@"WATCHDOG: 0 frames in %.0fs - tearing the session down", kNoFrameTimeout);
                     FUStatusSet(@"state", @"no frames (camera not delivering)");
                     [self teardown];
                     [self countCameraFailure];
                 }
             });
         } @catch (NSException *e) {
-            FU_LOG("runSession exception: %@", e.reason);
+            FU_LOG(@"runSession exception: %@", e.reason);
             [self failWith:[NSString stringWithFormat:@"session: %@", e.reason ?: @"?"]];
         }
     }
@@ -553,7 +553,7 @@ static float FUPrefFloat(NSString *key, float def) {
 
 // capture queue only
 - (void)failWith:(NSString *)why {
-    FU_LOG("camera failure: %@", why);
+    FU_LOG(@"camera failure: %@", why);
     FUStatusSet(@"lastError", why);
     FUStatusSet(@"state", why);
     [self teardown];
@@ -565,7 +565,7 @@ static float FUPrefFloat(NSString *key, float def) {
     _failStreak++;
     FUStatusSet(@"cameraFailures", @(_failStreak));
     if (_failStreak >= kMaxCameraFailures) {
-        FU_LOG("camera failed %d times in a row - auto-disabling so the phone stays usable",
+        FU_LOG(@"camera failed %d times in a row - auto-disabling so the phone stays usable",
                kMaxCameraFailures);
         FUKillSwitchEngage(@"auto-disabled: the camera could not be started inside SpringBoard "
                            @"(SpringBoard likely has no camera permission).\n"
@@ -584,7 +584,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         @try {
             _frames++;
             if (_frames == 1) {
-                FU_LOG("first frame received - camera is live in SpringBoard");
+                FU_LOG(@"first frame received - camera is live in SpringBoard");
                 FUStatusSet(@"state", @"scanning (frames arriving)");
                 FUStatusAdd(@"frameSessions", 1);
             }
@@ -594,7 +594,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             if (_lastAnalysis && [now timeIntervalSinceDate:_lastAnalysis] < kAnalysisInterval) return;
             _lastAnalysis = now;
             if (_deadline && [now timeIntervalSinceDate:_deadline] > 0) {
-                FU_LOG("scan window expired (best=%.3f)", _best);
+                FU_LOG(@"scan window expired (best=%.3f)", _best);
                 [self stopScanning];
                 FUStatusSet(@"state", @"idle (window expired)");
                 return;
@@ -627,7 +627,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             NSTimeInterval t = [NSDate timeIntervalSinceReferenceDate];
             if (t - _lastLog > 1.5) {
                 _lastLog = t;
-                FU_LOG("distance=%.3f (threshold=%.2f)", best, self.threshold);
+                FU_LOG(@"distance=%.3f (threshold=%.2f)", best, self.threshold);
             }
 
             if (best < self.threshold) {
@@ -640,7 +640,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 _consecutive = 0;
             }
         } @catch (NSException *e) {
-            FU_LOG("frame exception: %@", e.reason);
+            FU_LOG(@"frame exception: %@", e.reason);
             [self stopScanning];
         }
     }
@@ -650,7 +650,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 - (void)requestUnlock:(float)distance {
     if (_unlocking) return;
     _unlocking = YES;
-    FU_LOG("MATCH (distance=%.3f) - unlocking", distance);
+    FU_LOG(@"MATCH (distance=%.3f) - unlocking", distance);
     FUStatusSet(@"lastMatch", @(distance));
     FUStatusAdd(@"matches", 1);
     [self stopScanning];
@@ -666,7 +666,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         NSMutableArray *log = [NSMutableArray array];
         id mgr = [FUClass(@"SBLockScreenManager") sharedInstance];
         if (!mgr) {
-            FU_LOG("SBLockScreenManager unavailable");
+            FU_LOG(@"SBLockScreenManager unavailable");
             FUStatusSet(@"unlockPath", @"no SBLockScreenManager");
             _unlocking = NO;
             return;
@@ -721,7 +721,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         }
 
         NSString *path = log.count ? [log componentsJoinedByString:@" + "] : @"no route available";
-        FU_LOG("unlock routes: %@", path);
+        FU_LOG(@"unlock routes: %@", path);
         FUStatusSet(@"unlockPath", path);
 
         // did it actually work?
@@ -737,13 +737,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                     }
                 } @catch (NSException *e) {}
                 FUStatusSet(@"stillLockedAfterUnlock", @(stillLocked));
-                FU_LOG("post-unlock check: stillLocked=%d", stillLocked);
+                FU_LOG(@"post-unlock check: stillLocked=%d", stillLocked);
                 FUStatusFlush(YES);
                 self->_unlocking = NO;
             }
         });
     } @catch (NSException *e) {
-        FU_LOG("unlock chain exception: %@", e.reason);
+        FU_LOG(@"unlock chain exception: %@", e.reason);
         _unlocking = NO;
     }
 }
@@ -759,7 +759,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     %orig;
     @autoreleasepool {
         @try { [[FaceUnlockManager shared] noteLockScreenAppeared:self]; }
-        @catch (NSException *e) { FU_LOG("coverSheet hook: %@", e.reason); }
+        @catch (NSException *e) { FU_LOG(@"coverSheet hook: %@", e.reason); }
     }
 }
 %end
@@ -771,7 +771,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     %orig;
     @autoreleasepool {
         @try { [[FaceUnlockManager shared] noteLockScreenAppeared:self]; }
-        @catch (NSException *e) { FU_LOG("dashBoard hook: %@", e.reason); }
+        @catch (NSException *e) { FU_LOG(@"dashBoard hook: %@", e.reason); }
     }
 }
 %end
@@ -809,7 +809,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                        dispatch_get_main_queue(), ^{
             @autoreleasepool {
                 @try { [[FaceUnlockManager shared] start]; }
-                @catch (NSException *e) { FU_LOG("deferred start: %@", e.reason); }
+                @catch (NSException *e) { FU_LOG(@"deferred start: %@", e.reason); }
             }
         });
     }
