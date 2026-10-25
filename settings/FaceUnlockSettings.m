@@ -143,7 +143,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                         color:[UIColor whiteColor]];
     [_scroll addSubview:_titleLabel];
 
-    _versionLabel = [self label:@"v2.3.0 · 单会话版" size:12 weight:UIFontWeightRegular
+    _versionLabel = [self label:@"v2.4.0 · 单张可完成版" size:12 weight:UIFontWeightRegular
                           color:[UIColor colorWithWhite:0.6 alpha:1]];
     [_scroll addSubview:_versionLabel];
 
@@ -593,11 +593,12 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     BOOL                      _photoInFlight;
     BOOL                      _manualMode;    // system camera UI in use
     BOOL                      _pickerUp;
+    NSUInteger                _presentRetries;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    FUSLog(@"enroll viewDidLoad (v2.3.0 single-session)");
+    FUSLog(@"enroll viewDidLoad (v2.4.0 single-session)");
     self.view.backgroundColor = [UIColor blackColor];
     _collected = [NSMutableArray array];
     _queue = dispatch_queue_create("com.ray835999.faceunlock.enroll", DISPATCH_QUEUE_SERIAL);
@@ -655,7 +656,7 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     // AVCaptureSession can, so enrollment is possible even when every
     // programmatic path fails.
     _manualButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_manualButton setTitle:@"系统相机拍照 5 张" forState:UIControlStateNormal];
+    [_manualButton setTitle:@"系统相机录入" forState:UIControlStateNormal];
     [_manualButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     _manualButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     _manualButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
@@ -1029,8 +1030,8 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
         [self stopPhotoPump];
         self->_manualButton.hidden = NO;
         self->_manualButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
-        [self->_manualButton setTitle:@"点这里：系统相机拍 5 张" forState:UIControlStateNormal];
-        self->_hintLabel.text = @"这台设备上自动取帧拿不到画面\n请点最下面蓝色的按钮，用系统相机拍 5 张";
+        [self->_manualButton setTitle:@"点这里：用系统相机录入" forState:UIControlStateNormal];
+        self->_hintLabel.text = @"这台设备上自动取帧拿不到画面\n请点下面蓝色的按钮用系统相机录入——拍一张就能保存";
         [self publishMeter];
     };
     if ([NSThread isMainThread]) b(); else dispatch_async(dispatch_get_main_queue(), b);
@@ -1039,50 +1040,130 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
 - (void)manualTapped:(UIButton *)b {
     if (_finished) return;
     if (_pickerUp) return;
-    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeCamera]) {
+
+    // The system camera's shutter can go dead after the first shot: on 15.x a
+    // jailbroken process does not always get the capture device back between
+    // two pickers, and the second picker shows a greyed-out shutter.  So once
+    // one sample exists we stop re-opening the camera behind the user's back
+    // and let them choose: another shot, or a photo from the album — the album
+    // picker never touches the capture device, so it always works.
+    if (_manualMode && _collected.count > 0) {
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"再补一张"
+                             message:@"系统相机拍不了第二张时，从相册选最稳。"
+                      preferredStyle:UIAlertControllerStyleActionSheet];
+        __weak FUSEnrollViewController *weakSelf = self;
+        [a addAction:[UIAlertAction actionWithTitle:@"用系统相机拍"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *x) {
+            [weakSelf openPicker:UIImagePickerControllerSourceTypeCamera];
+        }]];
+        if ([UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
+            [a addAction:[UIAlertAction actionWithTitle:@"从相册选一张"
+                                                 style:UIAlertActionStyleDefault
+                                               handler:^(UIAlertAction *x) {
+                [weakSelf openPicker:UIImagePickerControllerSourceTypePhotoLibrary];
+            }]];
+        }
+        [a addAction:[UIAlertAction actionWithTitle:@"取消"
+                                             style:UIAlertActionStyleCancel handler:nil]];
+        a.popoverPresentationController.sourceView = b;
+        a.popoverPresentationController.sourceRect = b.bounds;
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    [self openPicker:UIImagePickerControllerSourceTypeCamera];
+}
+
+// Opens the system camera or the album picker.  Any capture session is torn
+// down first, so the picker is never handed a camera that is still being
+// released — that is what makes the shutter dead.
+- (void)openPicker:(UIImagePickerControllerSourceType)src {
+    if (_finished) return;
+    if (_pickerUp) return;
+    if (![UIImagePickerController isSourceTypeAvailable:src]) {
         [self failWith:@"这台设备没有可用的相机 UI"];
         return;
     }
-    FUSLog(@"manual tapped (collected %lu)", (unsigned long)_collected.count);
+    FUSLog(@"openPicker src=%ld (collected %lu)", (long)src,
+           (unsigned long)_collected.count);
     _manualMode = YES;
     _manualButton.hidden = NO;
-    _sourceNote = @"系统相机";
+    _sourceNote = (src == UIImagePickerControllerSourceTypeCamera) ? @"系统相机" : @"相册";
     _linkNote   = @"system UI";
     [self stopPhotoPump];
     [self publishMeter];
-    [self setHint:@"正在打开系统相机…"];
+    [self setHint:(src == UIImagePickerControllerSourceTypeCamera)
+                  ? @"正在打开系统相机…"
+                  : @"正在打开相册…"];
 
-    // the system camera can only open once our session has released the device
     __weak FUSEnrollViewController *weakSelf = self;
     [self teardownSessionThen:^{
-        [weakSelf presentSystemCamera];
+        // stopRunning returns before the camera hardware is fully released.
+        // Handing a still-releasing device to the picker is exactly what
+        // leaves its shutter greyed out, so wait a beat.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf presentPicker:src];
+        });
     }];
 }
 
-- (void)presentSystemCamera {
+- (void)presentPicker:(UIImagePickerControllerSourceType)src {
     if (_finished) { _manualMode = NO; return; }
     if (_pickerUp) return;
     if (!self.view.window) {
         FUSLog(@"enroll view is not in a window, cannot present the picker");
         _manualMode = NO;
-        [self setHint:@"页面已经不在前台，无法打开系统相机"];
+        [self setHint:@"页面已经不在前台，无法打开相机"];
         return;
     }
     if (self.presentedViewController) {
-        FUSLog(@"already presenting %@", self.presentedViewController);
+        // An action sheet or the previous picker may still be animating away.
+        // Silently giving up here is how the screen ends up with no way
+        // forward, so retry a few times before saying anything.
+        FUSLog(@"still presenting %@ (retry %lu)",
+               self.presentedViewController, (unsigned long)_presentRetries);
         _pickerUp = NO;
+        if (++_presentRetries <= 4) {
+            __weak FUSEnrollViewController *ws = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [ws presentPicker:src]; });
+        } else {
+            _presentRetries = 0;
+            [self setHint:@"相机界面没能打开（页面还盖着别的东西）\n点左边按钮再试一次"];
+            [self refreshManualUI];
+        }
         return;
     }
+    _presentRetries = 0;
     _pickerUp = YES;
     UIImagePickerController *p = [UIImagePickerController new];
-    p.sourceType   = UIImagePickerControllerSourceTypeCamera;
-    p.cameraDevice = UIImagePickerControllerCameraDeviceFront;
+    p.sourceType = src;
+    if (src == UIImagePickerControllerSourceTypeCamera) {
+        p.cameraDevice = UIImagePickerControllerCameraDeviceFront;
+    }
     p.allowsEditing = NO;
     p.delegate = self;
-    FUSLog(@"presenting the system camera");
+    FUSLog(@"presenting picker src=%ld", (long)src);
     [self presentViewController:p animated:YES completion:^{
-        FUSLog(@"system camera is up");
+        FUSLog(@"picker is up (src=%ld)", (long)src);
     }];
+
+    // If the picker never actually becomes the presented controller the
+    // shutter is unreachable — say so instead of leaving a dead screen.
+    __weak FUSEnrollViewController *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss || ss->_finished) return;
+        if (ss.presentedViewController == p) return;
+        if (!ss->_pickerUp) return;
+        FUSLog(@"picker never came up");
+        ss->_pickerUp = NO;
+        [ss setHint:@"相机界面没能打开（摄像头还被占用）\n点左边按钮重试，或用右边按钮先完成录入"];
+        [ss refreshManualUI];
+    });
 }
 
 - (void)imagePickerController:(UIImagePickerController *)picker
@@ -1104,10 +1185,9 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
     if (_finished) return;
     if (![img isKindOfClass:[UIImage class]]) {
         [self setHint:@"系统相机没有返回照片\n请再拍一次"];
-        [self rearmManual];
+        [self refreshManualUI];
         return;
     }
-    _sourceNote = @"系统相机";
     [self setHint:@"收到照片，正在识别…"];
     [self publishMeter];
 
@@ -1115,10 +1195,11 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
     if (!pb) {
         FUSLog(@"could not convert the still to a pixel buffer");
         [self setHint:@"这张照片转换失败\n请再拍一次（正对镜头、光线亮一点）"];
-        [self rearmManual];
+        [self refreshManualUI];
         return;
     }
 
+    NSUInteger before = _collected.count;
     __weak FUSEnrollViewController *weakSelf = self;
     dispatch_async(_queue, ^{
         @autoreleasepool {
@@ -1131,39 +1212,67 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
             dispatch_async(dispatch_get_main_queue(), ^{
                 FUSEnrollViewController *s2 = weakSelf;
                 if (!s2 || s2->_finished) return;
-                if (s2->_collected.count < kSamples) [s2 rearmManual];
+                if (s2->_collected.count >= kSamples) return;
+                if (s2->_collected.count > before) {
+                    [s2 rearmManual];
+                } else {
+                    // the shot was rejected: keep the reason that
+                    // processPixelBuffer just put on screen, only refresh the
+                    // buttons so there is still a way forward
+                    [s2 refreshManualUI];
+                }
             });
         }
     });
 }
 
-// Wait for the processing pass to report, then shoot the next one.
+// After each shot: refresh the two buttons and stop.  We deliberately do NOT
+// re-open the picker automatically — a picker that pops up by itself with a
+// dead shutter is exactly the "the shutter button won't press" report.  The
+// user taps 「再拍一张」 when ready, and that menu also offers the album.
+- (void)refreshManualUI {
+    if (!_manualMode || _finished) return;
+    NSUInteger n = _collected.count;
+    [_manualButton setTitle:[NSString stringWithFormat:@"再拍一张（已 %lu/%lu）",
+                             (unsigned long)n, (unsigned long)kSamples]
+                   forState:UIControlStateNormal];
+    _manualButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
+    if (n > 0) {
+        _retryButton.hidden = NO;
+        [_retryButton setTitle:[NSString stringWithFormat:@"用这 %lu 张完成",
+                                (unsigned long)n]
+                      forState:UIControlStateNormal];
+    }
+}
+
 - (void)rearmManual {
     if (_finished || !_manualMode) return;
-    __weak FUSEnrollViewController *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        FUSEnrollViewController *ss = weakSelf;
-        if (!ss || ss->_finished || !ss->_manualMode) return;
-        if (ss->_collected.count >= kSamples) return;
-        [ss presentSystemCamera];
-    });
+    [self refreshManualUI];
+    NSUInteger n = _collected.count;
+    if (n >= kSamples) return;
+    [self setHint:[NSString stringWithFormat:
+        @"已采集 %lu/%lu\n点左边「再拍一张」继续（可以选相册），或点右边先完成",
+        (unsigned long)n, (unsigned long)kSamples]];
 }
 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     _pickerUp = NO;
     __weak FUSEnrollViewController *weakSelf = self;
-    // _manualMode drops only after the dismissal finishes, so the
-    // viewDidAppear that this dismissal triggers does not silently restart the
-    // capture session underneath the animation.
+    // _manualMode stays YES: the two on-screen buttons are now the only way
+    // forward, and the viewDidAppear triggered by this dismissal must not
+    // restart the capture session underneath the animation.
     [picker dismissViewControllerAnimated:YES completion:^{
         FUSEnrollViewController *ss = weakSelf;
         if (!ss || ss->_finished) return;
-        ss->_manualMode = NO;
-        ss->_retryButton.hidden = NO;
-        [ss setHint:[NSString stringWithFormat:
-            @"已取消系统相机 · 已采集 %lu/%lu\n点「系统相机拍照」再来，或点「重试打开相机」",
-            (unsigned long)ss->_collected.count, (unsigned long)kSamples]];
+        [ss refreshManualUI];
+        NSUInteger n = ss->_collected.count;
+        if (n > 0) {
+            [ss setHint:[NSString stringWithFormat:
+                @"已取消 · 已采集 %lu/%lu\n点左边再拍一张，或点右边「用这 %lu 张完成」",
+                (unsigned long)n, (unsigned long)kSamples, (unsigned long)n]];
+        } else {
+            [ss setHint:@"已取消 · 还没采到样本\n点左边重新打开相机"];
+        }
     }];
 }
 
@@ -1181,6 +1290,24 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
 }
 
 - (void)retryTapped:(UIButton *)b {
+    // In the system-camera flow this button doubles as "finish with what I
+    // already have".  The picker's shutter can die after the first shot, so a
+    // single good sample must be enough to save — otherwise enrollment has no
+    // exit at all.
+    if (_manualMode && _collected.count > 0) {
+        FUSLog(@"finishing the manual flow with %lu sample(s)",
+               (unsigned long)_collected.count);
+        _finished = YES;
+        [self stopPhotoPump];
+        _pickerUp   = NO;
+        _manualMode = NO;
+        if (self.presentedViewController) {
+            [self.presentedViewController dismissViewControllerAnimated:NO completion:nil];
+        }
+        [self finish];
+        return;
+    }
+
     FUSLog(@"retry tapped");
     [self stopPhotoPump];
     _manualMode = NO;
@@ -1422,6 +1549,7 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
             self->_hintLabel.text = (n >= kSamples) ? @"采集完成，正在保存…"
                                                     : @"很好，稍微换个角度";
             [self publishMeter];
+            if (self->_manualMode) [self refreshManualUI];
         });
         if (n >= kSamples) {
             _finished = YES;
@@ -1433,7 +1561,9 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
 }
 
 - (void)finish {
-    FUSLog(@"finish: saving %lu templates", (unsigned long)_collected.count);
+    NSUInteger n = _collected.count;
+    FUSLog(@"finish: saving %lu templates", (unsigned long)n);
+    _finished = YES;
     // dismiss any picker still on screen before the save-alert goes up
     if (self.presentedViewController) {
         [self.presentedViewController dismissViewControllerAnimated:NO completion:nil];
@@ -1441,6 +1571,13 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     _pickerUp = NO;
     _manualMode = NO;
     [self stopCamera];
+
+    // never overwrite a good template set with nothing
+    if (n == 0) {
+        _finished = NO;
+        [self failWith:@"还没采到任何样本\n请再拍一张"];
+        return;
+    }
 
     BOOL ok = [FacePrint saveTemplates:_collected];
     FUSLog(@"saveTemplates -> %d", (int)ok);
@@ -1454,10 +1591,15 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     notify_post(kNotifyName);
     UIViewController *presenter = self.presentingViewController;
     __weak UIViewController *weakPresenter = presenter;
+    NSString *msg = (n >= kSamples)
+        ? @"已保存 5 个人脸样本。\n现在锁屏，把脸对准前置摄像头即可解锁。\n\n如果没反应，回到 App 首页看「当前状态」那一行。"
+        : [NSString stringWithFormat:
+            @"只保存了 %lu 个样本（目标是 5 个）。\n现在锁屏就能试。\n如果经常认不出，回 App 再点一次「录入人脸」补齐。",
+            (unsigned long)n];
     [self dismissViewControllerAnimated:YES completion:^{
         UIAlertController *a = [UIAlertController
             alertControllerWithTitle:@"录入完成"
-                             message:@"已保存 5 个人脸样本。\n现在锁屏，把脸对准前置摄像头即可解锁。\n\n如果没反应，回到 App 首页看「当前状态」那一行。"
+                             message:msg
                       preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"好"
                                               style:UIAlertActionStyleDefault
