@@ -17,6 +17,7 @@
 #import <notify.h>
 #import <objc/runtime.h>
 #import <CoreImage/CoreImage.h>
+#import <PhotosUI/PhotosUI.h>
 #import <math.h>
 
 static NSString *const kDir        = @"/var/jb/var/mobile/Library/FaceUnlock";
@@ -143,7 +144,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                         color:[UIColor whiteColor]];
     [_scroll addSubview:_titleLabel];
 
-    _versionLabel = [self label:@"v2.5.0 · App 内快门版" size:12 weight:UIFontWeightRegular
+    _versionLabel = [self label:@"v2.6.0 · 相册导入版" size:12 weight:UIFontWeightRegular
                           color:[UIColor colorWithWhite:0.6 alpha:1]];
     [_scroll addSubview:_versionLabel];
 
@@ -543,8 +544,47 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     return pb;
 }
 
+// UIImage -> template, with a user-facing reason when it cannot be used.
+// Shared by the album import and the in-app shutter so both routes feed the
+// same detect / feature-print / template pipeline and stay comparable.
+static NSDictionary *FUSTemplateFromImage(UIImage *img, NSString **why) {
+    if (why) *why = nil;
+    if (![img isKindOfClass:[UIImage class]] || !img.CGImage) {
+        if (why) *why = @"这张不是能读的图片";
+        return nil;
+    }
+    CVPixelBufferRef pb = FUSPixelBufferFromImage(img);
+    if (!pb) {
+        if (why) *why = @"图片转换失败（尺寸异常？）";
+        return nil;
+    }
+    float q = -1.0f;
+    VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb
+                                                     qualityGate:NO
+                                                         quality:&q];
+    if (!face) {
+        if (why) *why = (q >= 0.0f)
+            ? [NSString stringWithFormat:@"太暗/太糊（质量 %.2f）", q]
+            : @"这张里没检测到人脸";
+        CVPixelBufferRelease(pb);
+        return nil;
+    }
+    VNFeaturePrintObservation *pr = [FacePrint observationForFace:face
+                                                      pixelBuffer:pb
+                                                        logPrefix:@"album"];
+    CVPixelBufferRelease(pb);
+    if (!pr) {
+        if (why) *why = @"特征提取失败";
+        return nil;
+    }
+    NSDictionary *t = [FacePrint templateForPrint:pr];
+    if (!t && why) *why = @"特征生成失败";
+    return t;
+}
+
 @interface FUSEnrollViewController () <UIImagePickerControllerDelegate,
-                                       UINavigationControllerDelegate>
+                                       UINavigationControllerDelegate,
+                                       PHPickerViewControllerDelegate>
 @end
 
 #pragma mark - in-app shutter
@@ -1059,11 +1099,18 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     BOOL                      _manualMode;    // system camera UI in use
     BOOL                      _pickerUp;
     NSUInteger                _presentRetries;
+
+    // album import: the only route that never touches the capture device
+    UIButton                 *_camButton;
+    BOOL                      _albumRunning;
+    NSUInteger                _albumPicked;
+    NSUInteger                _albumDone;
+    NSUInteger                _albumBad;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    FUSLog(@"enroll viewDidLoad (v2.5.0 in-app shutter)");
+    FUSLog(@"enroll viewDidLoad (v2.6.0 album import)");
     self.view.backgroundColor = [UIColor blackColor];
     _collected = [NSMutableArray array];
     _queue = dispatch_queue_create("com.ray835999.faceunlock.enroll", DISPATCH_QUEUE_SERIAL);
@@ -1117,19 +1164,32 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
             forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_cancelButton];
 
-    // Always available: the system camera UI cannot be starved the way an
-    // AVCaptureSession can, so enrollment is possible even when every
-    // programmatic path fails.
+    // Primary route: import from the album.  PHPicker runs out of process and
+    // never opens the capture device, so it cannot be starved the way an
+    // in-process AVCaptureSession can — this is the route that always works.
     _manualButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_manualButton setTitle:@"打开相机录入" forState:UIControlStateNormal];
+    [_manualButton setTitle:@"① 从相册选照片（推荐）" forState:UIControlStateNormal];
     [_manualButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _manualButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    _manualButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
+    _manualButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _manualButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
     _manualButton.layer.cornerRadius = 8;
     _manualButton.exclusiveTouch = YES;
-    [_manualButton addTarget:self action:@selector(manualTapped:)
+    [_manualButton addTarget:self action:@selector(albumTapped:)
             forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_manualButton];
+
+    // Secondary route: our own camera page, top-right.  Kept because it is the
+    // only path that produces a fresh sample on devices where captures work.
+    _camButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_camButton setTitle:@"② 相机" forState:UIControlStateNormal];
+    [_camButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _camButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    _camButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+    _camButton.layer.cornerRadius = 9;
+    _camButton.exclusiveTouch = YES;
+    [_camButton addTarget:self action:@selector(manualTapped:)
+         forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_camButton];
 
     _retryButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_retryButton setTitle:@"重试打开相机" forState:UIControlStateNormal];
@@ -1173,6 +1233,7 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     CGFloat rowY = meterY - 8 - rowH;
 
     _cancelButton.frame  = CGRectMake(insets.left + 16, insets.top + 8, 68, 38);
+    _camButton.frame     = CGRectMake(w - insets.right - 16 - 72, insets.top + 8, 72, 38);
     _progressLabel.frame = CGRectMake(16, insets.top + 12, w - 32, 30);
     _hintLabel.frame     = CGRectMake(24, CGRectGetMaxY(_guide.frame) + 10, w - 48,
                                       MAX(30, rowY - CGRectGetMaxY(_guide.frame) - 20));
@@ -1487,6 +1548,180 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     }
 }
 
+#pragma mark - album import (out of process, never touches the capture device)
+//
+// On this device every in-process capture path is mute: the video-data output
+// never delivers a buffer and AVCapturePhotoOutput never calls back, while the
+// preview layer keeps rendering (it is drawn by mediaserverd, not by us).  The
+// system camera app is broken in the same way.  PHPicker runs in its own
+// process and only hands over decoded images, so it is the one route that can
+// always produce a sample.
+
+- (void)albumTapped:(UIButton *)b {
+    if (_finished || _albumRunning || _pickerUp) return;
+    FUSLog(@"albumTapped (collected %lu)", (unsigned long)_collected.count);
+    _albumRunning = YES;          // lock for the whole album round-trip
+    _manualMode = YES;
+    _manualButton.hidden = NO;
+    _sourceNote = @"相册";
+    _linkNote   = @"phpicker";
+    [self publishMeter];
+
+    NSUInteger room = (_collected.count < kSamples) ? (kSamples - _collected.count) : 1;
+    __weak FUSEnrollViewController *weakSelf = self;
+    [self teardownSessionThen:^{
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss || ss->_finished) return;
+        if (ss.presentedViewController) {
+            FUSLog(@"album blocked by %@", ss.presentedViewController);
+            ss->_albumRunning = NO;
+            [ss setHint:@"页面还盖着别的窗口\n等一下再点"];
+            [ss refreshManualUI];
+            return;
+        }
+        if (@available(iOS 14.0, *)) {
+            [ss presentPHPickerWithRoom:room];
+        } else {
+            [ss openPicker:UIImagePickerControllerSourceTypePhotoLibrary];
+        }
+    }];
+}
+
+- (void)presentPHPickerWithRoom:(NSUInteger)room {
+    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+    cfg.filter = [PHPickerFilter imagesFilter];
+    cfg.selectionLimit = (NSInteger)room;
+    PHPickerViewController *p = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+    p.delegate = self;
+    _pickerUp = YES;
+    [self setHint:[NSString stringWithFormat:
+        @"选 %lu 张正面自拍（已经没有脸的照片也没关系，一张也行）",
+        (unsigned long)room]];
+    FUSLog(@"presenting PHPicker, limit=%lu", (unsigned long)room);
+    [self presentViewController:p animated:YES completion:^{
+        FUSLog(@"PHPicker is up");
+    }];
+
+    // never leave the user on a screen where the tap "did nothing"
+    __weak FUSEnrollViewController *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss || ss->_finished || !ss->_pickerUp) return;
+        if (ss.presentedViewController == p) return;
+        FUSLog(@"PHPicker never came up");
+        ss->_pickerUp = NO;
+        ss->_albumRunning = NO;
+        [ss setHint:@"相册界面没能打开\n再点一次，或用右上角「相机」"];
+        [ss refreshManualUI];
+    });
+}
+
+- (void)picker:(PHPickerViewController *)picker
+    didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    _pickerUp = NO;
+    FUSLog(@"PHPicker returned %lu item(s)", (unsigned long)results.count);
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    [self ingestPickerResults:results];
+}
+
+- (void)ingestPickerResults:(NSArray<PHPickerResult *> *)results {
+    if (_finished) return;
+    NSUInteger n = results.count;
+    if (n == 0) {
+        _albumRunning = NO;
+        _pickerUp = NO;
+        [self setHint:@"没有选中照片\n点左边按钮再来一次"];
+        [self refreshManualUI];
+        return;
+    }
+    _albumPicked  = n;
+    __weak FUSEnrollViewController *weakSelf = self;
+    __block NSUInteger pending = n;
+    __block NSMutableArray *made = [NSMutableArray array];
+    __block NSString *lastWhy = nil;
+    [self setHint:[NSString stringWithFormat:@"正在识别 %lu 张照片…", (unsigned long)n]];
+
+    // every item reports exactly once; the counter lives on the main queue so
+    // no lock is needed
+    void (^step)(NSDictionary *, NSString *) = ^(NSDictionary *t, NSString *why) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            FUSEnrollViewController *ss = weakSelf;
+            if (!ss) return;
+            if (t) [made addObject:t];
+            else if (why) lastWhy = why;
+            if (--pending > 0) return;
+            [ss albumImportFinished:made lastWhy:lastWhy total:n];
+        });
+    };
+
+    for (PHPickerResult *r in results) {
+        NSItemProvider *ip = r.itemProvider;
+        if (!ip || ![ip canLoadObjectOfClass:[UIImage class]]) {
+            FUSLog(@"album item cannot load a UIImage");
+            step(nil, @"有一张读不出来");
+            continue;
+        }
+        dispatch_queue_t workQ = _queue;
+        [ip loadObjectOfClass:[UIImage class]
+            completionHandler:^(__kindof id<NSItemProviderReading> obj, NSError *err) {
+            UIImage *img = [obj isKindOfClass:[UIImage class]] ? (UIImage *)obj : nil;
+            if (err || !img) {
+                FUSLog(@"album load failed: %@", err);
+                step(nil, @"有一张读不出来");
+                return;
+            }
+            dispatch_async(workQ, ^{
+                @autoreleasepool {
+                    NSString *why = nil;
+                    NSDictionary *t = FUSTemplateFromImage(img, &why);
+                    if (!t) FUSLog(@"album reject: %@", why);
+                    step(t, why);
+                }
+            });
+        }];
+    }
+
+    // a provider that never calls back must not lock the album button forever
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss || !ss->_albumRunning) return;
+        FUSLog(@"album watchdog: %lu of %lu item(s) never reported",
+               (unsigned long)pending, (unsigned long)n);
+        [ss albumImportFinished:made lastWhy:lastWhy total:n];
+    });
+}
+
+- (void)albumImportFinished:(NSArray *)made lastWhy:(NSString *)why total:(NSUInteger)total {
+    if (!_albumRunning) return;      // already reported (watchdog beat us here)
+    _albumRunning = NO;
+    _albumDone = made.count;
+    _albumBad  = (total > made.count) ? (total - made.count) : 0;
+    for (NSDictionary *t in made) [_collected addObject:t];
+    FUSLog(@"album import: %lu/%lu good, total samples %lu",
+           (unsigned long)made.count, (unsigned long)total,
+           (unsigned long)_collected.count);
+    [self publishMeter];
+
+    if (_collected.count >= kSamples) {
+        _finished = YES;
+        [self finish];
+        return;
+    }
+    [self refreshManualUI];
+    if (made.count > 0) {
+        [self setHint:[NSString stringWithFormat:
+            @"成功 %lu 张 · 现在共 %lu/%lu\n可以继续选，或点右边「保存 %lu 张」直接完成",
+            (unsigned long)made.count, (unsigned long)_collected.count,
+            (unsigned long)kSamples, (unsigned long)_collected.count]];
+    } else {
+        [self setHint:[NSString stringWithFormat:
+            @"这一批一张都没成：%@\n换几张清晰正面自拍（光线亮点、别侧头）再试",
+            why ?: @"没检测到人脸"]];
+    }
+}
+
 #pragma mark - camera: system UI (cannot fail)
 
 - (void)uiManualOnly {
@@ -1494,9 +1729,10 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
         if (self->_finished || self->_manualMode) return;
         [self stopPhotoPump];
         self->_manualButton.hidden = NO;
+        [self->_manualButton setTitle:@"① 从相册选照片（推荐）" forState:UIControlStateNormal];
         self->_manualButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
-        [self->_manualButton setTitle:@"点这里：打开相机录入" forState:UIControlStateNormal];
-        self->_hintLabel.text = @"这台设备上自动取帧拿不到画面\n请点下面蓝色的按钮，用 App 内快门拍——快门是我们自己的按钮";
+        self->_hintLabel.text = @"这台设备上 App 拿不到任何一帧画面（视频和拍照都是）\n"
+                                @"请点左边蓝色按钮「从相册选照片」";
         [self publishMeter];
     };
     if ([NSThread isMainThread]) b(); else dispatch_async(dispatch_get_main_queue(), b);
@@ -1505,37 +1741,9 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
 - (void)manualTapped:(UIButton *)b {
     if (_finished) return;
     if (_pickerUp) return;
-
-    // The system camera UI is dead on this device: after one shot only its
-    // "Cancel" button responds.  So the shutter lives in our own view
-    // controller (FUSShotViewController) and the system camera is never opened.
-    // When samples already exist, the album stays available as a second route —
-    // it never touches the capture device, so it can never go mute.
-    if (_manualMode && _collected.count > 0) {
-        UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"继续采集"
-                             message:@"用 App 内快门接着拍，或从相册里挑一张自拍。"
-                      preferredStyle:UIAlertControllerStyleActionSheet];
-        __weak FUSEnrollViewController *weakSelf = self;
-        [a addAction:[UIAlertAction actionWithTitle:@"用 App 内快门拍"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *x) {
-            [weakSelf openShutter];
-        }]];
-        if ([UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
-            [a addAction:[UIAlertAction actionWithTitle:@"从相册选一张"
-                                                 style:UIAlertActionStyleDefault
-                                               handler:^(UIAlertAction *x) {
-                [weakSelf openPicker:UIImagePickerControllerSourceTypePhotoLibrary];
-            }]];
-        }
-        [a addAction:[UIAlertAction actionWithTitle:@"取消"
-                                             style:UIAlertActionStyleCancel handler:nil]];
-        a.popoverPresentationController.sourceView = b;
-        a.popoverPresentationController.sourceRect = b.bounds;
-        [self presentViewController:a animated:YES completion:nil];
-        return;
-    }
+    // The album (left, big) is the reliable route; this is the live-camera one.
+    // The in-app shutter is kept because it is the only path that captures a
+    // fresh sample on devices where AVCapturePhotoOutput does answer.
     [self openShutter];
 }
 
@@ -1615,11 +1823,12 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     [self refreshManualUI];
     if (added > 0) {
         [self setHint:[NSString stringWithFormat:
-            @"已采集 %lu/%lu\n点左边继续拍，或点右边先完成（少几张也能用）",
-            (unsigned long)_collected.count, (unsigned long)kSamples]];
+            @"已采集 %lu/%lu\n点右边「保存 %lu 张」就能完成（少几张也能用）",
+            (unsigned long)_collected.count, (unsigned long)kSamples,
+            (unsigned long)_collected.count]];
     } else {
         [self setHint:[NSString stringWithFormat:
-            @"还没采到新样本 · 总计 %lu/%lu\n点左边再试，或点右边用相册",
+            @"相机这条路还是没给画面 · 总计 %lu/%lu\n点左边蓝色按钮改用相册导入",
             (unsigned long)_collected.count, (unsigned long)kSamples]];
     }
 }
@@ -1781,13 +1990,15 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
 - (void)refreshManualUI {
     if (!_manualMode || _finished) return;
     NSUInteger n = _collected.count;
-    [_manualButton setTitle:[NSString stringWithFormat:@"再拍一张（已 %lu/%lu）",
-                             (unsigned long)n, (unsigned long)kSamples]
+    [_manualButton setTitle:(n > 0
+            ? [NSString stringWithFormat:@"① 继续选照片（已 %lu/%lu）",
+                                         (unsigned long)n, (unsigned long)kSamples]
+            : @"① 从相册选照片（推荐）")
                    forState:UIControlStateNormal];
     _manualButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
     if (n > 0) {
         _retryButton.hidden = NO;
-        [_retryButton setTitle:[NSString stringWithFormat:@"用这 %lu 张完成",
+        [_retryButton setTitle:[NSString stringWithFormat:@"保存 %lu 张",
                                 (unsigned long)n]
                       forState:UIControlStateNormal];
     }
@@ -1799,7 +2010,7 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
     NSUInteger n = _collected.count;
     if (n >= kSamples) return;
     [self setHint:[NSString stringWithFormat:
-        @"已采集 %lu/%lu\n点左边「再拍一张」继续（可以选相册），或点右边先完成",
+        @"已采集 %lu/%lu\n点左边继续选照片，或点右边直接保存",
         (unsigned long)n, (unsigned long)kSamples]];
 }
 
@@ -1816,10 +2027,10 @@ didFinishPickingMediaWithInfo:(NSDictionary<NSString *, id> *)info {
         NSUInteger n = ss->_collected.count;
         if (n > 0) {
             [ss setHint:[NSString stringWithFormat:
-                @"已取消 · 已采集 %lu/%lu\n点左边再拍一张，或点右边「用这 %lu 张完成」",
+                @"已取消 · 已采集 %lu/%lu\n点左边继续选，或点右边「保存 %lu 张」",
                 (unsigned long)n, (unsigned long)kSamples, (unsigned long)n]];
         } else {
-            [ss setHint:@"已取消 · 还没采到样本\n点左边重新打开相机"];
+            [ss setHint:@"已取消 · 还没采到样本\n点左边「从相册选照片」再来"];
         }
     }];
 }
@@ -2123,7 +2334,7 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     // never overwrite a good template set with nothing
     if (n == 0) {
         _finished = NO;
-        [self failWith:@"还没采到任何样本\n请再拍一张"];
+        [self failWith:@"还没采到任何样本\n请点「从相册选照片」再来一次"];
         return;
     }
 
@@ -2142,7 +2353,7 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     NSString *msg = (n >= kSamples)
         ? @"已保存 5 个人脸样本。\n现在锁屏，把脸对准前置摄像头即可解锁。\n\n如果没反应，回到 App 首页看「当前状态」那一行。"
         : [NSString stringWithFormat:
-            @"只保存了 %lu 个样本（目标是 5 个）。\n现在锁屏就能试。\n如果经常认不出，回 App 再点一次「录入人脸」补齐。",
+            @"只保存了 %lu 个样本（目标是 5 个）。\n现在锁屏就能试。\n如果经常认不出，回 App 点「继续选照片 / 保存」补齐。",
             (unsigned long)n];
     [self dismissViewControllerAnimated:YES completion:^{
         UIAlertController *a = [UIAlertController

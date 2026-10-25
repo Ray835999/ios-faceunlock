@@ -22,7 +22,7 @@ FaceUnlock_CFLAGS = -fobjc-arc
 # The app is a normal process: hard links are correct there.
 APPLICATION_NAME = FaceUnlockSettings
 FaceUnlockSettings_FILES = settings/main.m settings/FaceUnlockSettings.m FacePrint.m
-FaceUnlockSettings_FRAMEWORKS = UIKit Foundation AVFoundation Vision CoreImage CoreGraphics
+FaceUnlockSettings_FRAMEWORKS = UIKit Foundation AVFoundation Vision CoreImage CoreGraphics PhotosUI
 FaceUnlockSettings_CFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk
