@@ -33,6 +33,17 @@ static const float kMinQuality = 0.05f;
 // The orientation the detector last succeeded with (0 = not yet known).
 static NSInteger gOrientation = 0;
 
+// Where the last detection stopped. Shown in the enrollment UI so the failure
+// point is visible without a log dump: "the request ran and found nothing" is a
+// completely different problem from "Vision could not be messaged at all".
+static NSString *gDetectNote = @"(no detection yet)";
+
+static void FUSetDetectNote(NSString *note) {
+    @synchronized ([FacePrint class]) {
+        gDetectNote = note ? [note copy] : @"";
+    }
+}
+
 @interface FacePrint ()
 + (id)handlerForBuffer:(CVPixelBufferRef)pixelBuffer
            orientation:(CGImagePropertyOrientation)orientation;
@@ -114,10 +125,17 @@ static NSInteger gOrientation = 0;
     VNFaceObservation *face = nil;
     @try {
         id rectReq = [self.faceRectClass new];
-        if (!rectReq) return nil;
+        if (!rectReq) {
+            FUSetDetectNote(@"VNDetectFaceRectanglesRequest missing");
+            return nil;
+        }
         id<FUVNRequestHandler> handler = [self handlerForBuffer:pixelBuffer
                                                     orientation:orientation];
-        if (!handler) return nil;
+        if (!handler) {
+            FUSetDetectNote([NSString stringWithFormat:@"no handler (orient %@)",
+                             [self orientationName:orientation]]);
+            return nil;
+        }
 
         // The face-rect request alone decides whether there is a face. Its
         // result is read even when performRequests: reports a failure, because
@@ -125,10 +143,24 @@ static NSInteger gOrientation = 0;
         NSError *err = nil;
         @try { [handler performRequests:@[rectReq] error:&err]; } @catch (NSException *ex) {}
         id results = [rectReq valueForKey:@"results"];
-        if (![results isKindOfClass:[NSArray class]] || [results count] == 0) return nil;
+        if (![results isKindOfClass:[NSArray class]]) {
+            FUSetDetectNote([NSString stringWithFormat:@"rect: no results array (orient %@)",
+                             [self orientationName:orientation]]);
+            return nil;
+        }
+        if ([results count] == 0) {
+            FUSetDetectNote([NSString stringWithFormat:@"rect: 0 faces (orient %@)",
+                             [self orientationName:orientation]]);
+            return nil;
+        }
         id first = [results firstObject];
-        if (![first isKindOfClass:self.faceObsClass]) return nil;
+        if (![first isKindOfClass:self.faceObsClass]) {
+            FUSetDetectNote(@"rect: unexpected result class");
+            return nil;
+        }
         face = (VNFaceObservation *)first;
+        FUSetDetectNote([NSString stringWithFormat:@"rect: %lu face(s) (orient %@)",
+                         (unsigned long)[results count], [self orientationName:orientation]]);
 
         // Quality is a best-effort annotation, never a gate on detection.
         Class qualCls = self.faceQualClass;
@@ -153,6 +185,7 @@ static NSInteger gOrientation = 0;
         }
         return face;
     } @catch (NSException *ex) {
+        FUSetDetectNote([NSString stringWithFormat:@"exception: %@", ex.reason ?: ex.name]);
         return nil;
     }
 }
@@ -220,7 +253,15 @@ static NSInteger gOrientation = 0;
         if (outQuality) *outQuality = q;
         return f;
     }
+    FUSetDetectNote([NSString stringWithFormat:
+        @"probed all 8 orientations, 0 faces (buffer %ux%u)",
+        (unsigned)CVPixelBufferGetWidth(pixelBuffer),
+        (unsigned)CVPixelBufferGetHeight(pixelBuffer)]);
     return nil;
+}
+
++ (NSString *)lastDetectNote {
+    @synchronized (self) { return gDetectNote; }
 }
 
 #pragma mark - feature print

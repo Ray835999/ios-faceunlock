@@ -622,7 +622,10 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
             if (!pb) return;
 
-            VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb qualityGate:YES];
+            // qualityGate:NO — must match the enrollment app exactly, otherwise
+            // a face accepted at enrollment could be rejected here and the user
+            // would never unlock.
+            VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb qualityGate:NO];
             if (!face) return;
             FUStatusAdd(@"faces", 1);
             FUStatusSet(@"orientation", [FacePrint orientationName:[FacePrint workingOrientation]]);

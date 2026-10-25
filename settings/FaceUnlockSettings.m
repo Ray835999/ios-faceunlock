@@ -141,7 +141,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                         color:[UIColor whiteColor]];
     [_scroll addSubview:_titleLabel];
 
-    _versionLabel = [self label:@"v2.0.1 · 屏内诊断版" size:12 weight:UIFontWeightRegular
+    _versionLabel = [self label:@"v2.0.2 · 屏内诊断版" size:12 weight:UIFontWeightRegular
                           color:[UIColor colorWithWhite:0.6 alpha:1]];
     [_scroll addSubview:_versionLabel];
 
@@ -481,6 +481,8 @@ static const NSUInteger kSamples = 5;
     NSUInteger                _framesSeen;
     NSUInteger                _detectRuns;
     NSUInteger                _faceHits;
+    NSUInteger                _bufW;
+    NSUInteger                _bufH;
     float                     _lastQuality;
     BOOL                      _finished;
     BOOL                      _cameraConfigured;
@@ -577,7 +579,7 @@ static const NSUInteger kSamples = 5;
     _progressLabel.frame = CGRectMake(16, insets.top + 12, w - 32, 30);
     _hintLabel.frame     = CGRectMake(24, CGRectGetMaxY(_guide.frame) + 18, w - 48, 46);
     _retryButton.frame   = CGRectMake((w - 220) / 2, h - insets.bottom - 130, 220, 50);
-    _meterLabel.frame    = CGRectMake(16, h - insets.bottom - 12 - 32, w - 32, 32);
+    _meterLabel.frame    = CGRectMake(12, h - insets.bottom - 10 - 46, w - 24, 46);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -594,6 +596,16 @@ static const NSUInteger kSamples = 5;
 #pragma mark - camera
 - (void)startCamera {
     if (_cameraConfigured) return;
+
+    // If Vision itself is not usable in this process, say so immediately
+    // instead of leaving the user staring at a live preview that can never
+    // produce a sample.
+    if (![FacePrint visionAvailable]) {
+        FUSLog(@"Vision unavailable in the app process");
+        [self failWith:@"Vision 不可用：这台设备上无法做人脸检测。\n这是环境问题，不是操作问题。"];
+        return;
+    }
+
     _hintLabel.text = @"正在检查相机权限…";
 
     AVAuthorizationStatus st = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
@@ -679,6 +691,19 @@ static const NSUInteger kSamples = 5;
         _retryButton.hidden = YES;
         FUSLog(@"camera configured, starting session");
         dispatch_async(_queue, ^{ [session startRunning]; });
+
+        // Watchdog: a preview can appear while the data output delivers nothing
+        // (TCC denied at the process level, or the device is held elsewhere).
+        // Without this the user just stares at a working-looking camera forever.
+        __weak FUSEnrollViewController *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            FUSEnrollViewController *ss = weakSelf;
+            if (!ss || ss->_finished || !ss->_cameraConfigured) return;
+            if (ss->_framesSeen > 0) return;
+            FUSLog(@"WATCHDOG: 0 frames 4s after startRunning");
+            [ss setHint:@"相机在跑，但一帧画面都没收到\n（相机权限被拦，或被别的 App 占着）"];
+        });
     } @catch (NSException *e) {
         FUSLog(@"configureCamera exception: %@", e.reason);
         [self failWith:[NSString stringWithFormat:@"相机初始化异常：%@", e.reason ?: @"?"]];
@@ -731,10 +756,15 @@ static const NSUInteger kSamples = 5;
     NSDate *now = [NSDate date];
     if (_lastMeter && [now timeIntervalSinceDate:_lastMeter] < 0.25) return;
     _lastMeter = now;
+    // Two lines: the counters, then where the detection pipeline actually is.
+    // A screenshot of this is enough to tell which stage is broken.
     NSString *text = [NSString stringWithFormat:
-        @"帧 %lu · 检测 %lu · 命中 %lu · 方向 %@ · 质量 %.2f",
+        @"帧 %lu · 检测 %lu · 命中 %lu · 方向 %@ · 质量 %.2f\n%@ · 缓冲 %lux%lu · %@",
         (unsigned long)_framesSeen, (unsigned long)_detectRuns, (unsigned long)_faceHits,
-        [FacePrint orientationName:[FacePrint workingOrientation]], _lastQuality];
+        [FacePrint orientationName:[FacePrint workingOrientation]], _lastQuality,
+        [FacePrint visionAvailable] ? @"Vision OK" : @"Vision 不可用",
+        (unsigned long)_bufW, (unsigned long)_bufH,
+        [FacePrint lastDetectNote] ?: @"-"];
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self->_finished) self->_meterLabel.text = text;
     });
@@ -758,10 +788,23 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
             CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
             if (!pb) { [self publishMeter]; return; }
+            _bufW = CVPixelBufferGetWidth(pb);
+            _bufH = CVPixelBufferGetHeight(pb);
+
+            if (_detectRuns % 20 == 0) {
+                FUSLog(@"diag #%lu: frames=%lu faces=%lu buf=%lux%lu orient=%@ note=%@",
+                       (unsigned long)_detectRuns, (unsigned long)_framesSeen,
+                       (unsigned long)_faceHits, (unsigned long)_bufW, (unsigned long)_bufH,
+                       [FacePrint orientationName:[FacePrint workingOrientation]],
+                       [FacePrint lastDetectNote]);
+            }
 
             float q = -1.0f;
+            // qualityGate:NO on purpose — a mediocre-quality face must still be
+            // enrollable. The tweak uses the same setting, so both sides accept
+            // the same faces and their prints stay comparable.
             VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb
-                                                             qualityGate:YES
+                                                             qualityGate:NO
                                                                  quality:&q];
             _lastQuality = q;
             [self publishMeter];

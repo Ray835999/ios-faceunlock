@@ -67,6 +67,13 @@
 + (NSInteger)workingOrientation;
 + (NSString *)orientationName:(NSInteger)orientation;
 
+// Diagnostics: where the last detection stopped, e.g.
+//   "rect: 0 faces (right)"  -> the request ran but found nothing
+//   "no handler"             -> Vision could not even be messaged
+//   "exception: ..."         -> Vision threw
+// The enrollment UI shows this verbatim so a screenshot is enough to diagnose.
++ (NSString *)lastDetectNote;
+
 // Template record for persistence (never contains NSNull — plist-safe).
 + (NSDictionary *)templateForPrint:(VNFeaturePrintObservation *)print;
 
