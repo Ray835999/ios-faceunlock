@@ -625,6 +625,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb qualityGate:YES];
             if (!face) return;
             FUStatusAdd(@"faces", 1);
+            FUStatusSet(@"orientation", [FacePrint orientationName:[FacePrint workingOrientation]]);
 
             VNFeaturePrintObservation *print =
                 [FacePrint observationForFace:face pixelBuffer:pb logPrefix:@"tweak"];

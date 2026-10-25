@@ -141,7 +141,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                         color:[UIColor whiteColor]];
     [_scroll addSubview:_titleLabel];
 
-    _versionLabel = [self label:@"v2.0.0 · 屏内诊断版" size:12 weight:UIFontWeightRegular
+    _versionLabel = [self label:@"v2.0.1 · 屏内诊断版" size:12 weight:UIFontWeightRegular
                           color:[UIColor colorWithWhite:0.6 alpha:1]];
     [_scroll addSubview:_versionLabel];
 
@@ -348,6 +348,8 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     }
     [s appendFormat:@"会话/帧/脸 : %@ / %@ / %@\n",
         st[@"sessions"] ?: @0, st[@"frames"] ?: @0, st[@"faces"] ?: @0];
+    if (st[@"orientation"])
+        [s appendFormat:@"检测方向   : %@\n", st[@"orientation"]];
     if (st[@"lastDistance"])
         [s appendFormat:@"最近距离   : %.3f\n", [st[@"lastDistance"] floatValue]];
     if (st[@"cameraFailures"])
@@ -471,9 +473,15 @@ static const NSUInteger kSamples = 5;
     UIView                   *_guide;
     UILabel                  *_hintLabel;
     UILabel                  *_progressLabel;
+    UILabel                  *_meterLabel;
     UIButton                 *_cancelButton;
     UIButton                 *_retryButton;
     NSDate                   *_lastCapture;
+    NSDate                   *_lastMeter;
+    NSUInteger                _framesSeen;
+    NSUInteger                _detectRuns;
+    NSUInteger                _faceHits;
+    float                     _lastQuality;
     BOOL                      _finished;
     BOOL                      _cameraConfigured;
     BOOL                      _permissionResolved;
@@ -507,6 +515,18 @@ static const NSUInteger kSamples = 5;
     _progressLabel.textColor = [UIColor colorWithRed:0.45 green:0.95 blue:0.6 alpha:1];
     _progressLabel.textAlignment = NSTextAlignmentCenter;
     [self.view addSubview:_progressLabel];
+
+    // live pipeline meter: frames received / detections run / faces found.
+    // It makes the three possible failure points distinguishable on screen:
+    //   帧 stays 0        -> the camera never delivers (session problem)
+    //   命中 stays 0      -> frames arrive but Vision finds no face (orientation)
+    //   命中 > 0 but 0/5  -> faces found but samples rejected (quality/save)
+    _meterLabel = [self label:@"帧 0 · 检测 0 · 命中 0" size:11 weight:UIFontWeightRegular];
+    _meterLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    _meterLabel.textColor = [UIColor colorWithWhite:0.72 alpha:1];
+    _meterLabel.textAlignment = NSTextAlignmentCenter;
+    _meterLabel.numberOfLines = 0;
+    [self.view addSubview:_meterLabel];
 
     _cancelButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_cancelButton setTitle:@"取消" forState:UIControlStateNormal];
@@ -557,6 +577,7 @@ static const NSUInteger kSamples = 5;
     _progressLabel.frame = CGRectMake(16, insets.top + 12, w - 32, 30);
     _hintLabel.frame     = CGRectMake(24, CGRectGetMaxY(_guide.frame) + 18, w - 48, 46);
     _retryButton.frame   = CGRectMake((w - 220) / 2, h - insets.bottom - 130, 220, 50);
+    _meterLabel.frame    = CGRectMake(16, h - insets.bottom - 12 - 32, w - 32, 32);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -700,34 +721,80 @@ static const NSUInteger kSamples = 5;
 }
 
 #pragma mark - frames
+- (void)setHint:(NSString *)text {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self->_finished) self->_hintLabel.text = text;
+    });
+}
+
+- (void)publishMeter {
+    NSDate *now = [NSDate date];
+    if (_lastMeter && [now timeIntervalSinceDate:_lastMeter] < 0.25) return;
+    _lastMeter = now;
+    NSString *text = [NSString stringWithFormat:
+        @"帧 %lu · 检测 %lu · 命中 %lu · 方向 %@ · 质量 %.2f",
+        (unsigned long)_framesSeen, (unsigned long)_detectRuns, (unsigned long)_faceHits,
+        [FacePrint orientationName:[FacePrint workingOrientation]], _lastQuality];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self->_finished) self->_meterLabel.text = text;
+    });
+}
+
 - (void)captureOutput:(AVCaptureOutput *)output
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
     @autoreleasepool {
         @try {
             if (_finished || _collected.count >= kSamples) return;
-            NSDate *now = [NSDate date];
-            if (_lastCapture && [now timeIntervalSinceDate:_lastCapture] < 0.9) return;
-            _lastCapture = now;
+            _framesSeen++;
 
-            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
-            if (!pb) return;
-            VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb qualityGate:YES];
-            if (!face) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (!self->_finished) self->_hintLabel.text = @"没看到清晰的人脸，再靠近一点";
-                });
+            NSDate *now = [NSDate date];
+            if (_lastCapture && [now timeIntervalSinceDate:_lastCapture] < 0.7) {
+                [self publishMeter];
                 return;
             }
+            _lastCapture = now;
+            _detectRuns++;
+
+            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
+            if (!pb) { [self publishMeter]; return; }
+
+            float q = -1.0f;
+            VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb
+                                                             qualityGate:YES
+                                                                 quality:&q];
+            _lastQuality = q;
+            [self publishMeter];
+
+            if (!face) {
+                // q >= 0 means a face WAS found but rejected for quality, so the
+                // advice differs from "no face at all". Keeping these apart is
+                // what made the old build look like the camera was dead.
+                if (q >= 0.0f) {
+                    [self setHint:[NSString stringWithFormat:
+                        @"看到脸了，但画面太暗/太糊（质量 %.2f）\n换个亮一点的地方", q]];
+                } else {
+                    [self setHint:[NSString stringWithFormat:
+                        @"没检测到人脸 · 正对镜头，别侧头（已检测 %lu 次）",
+                        (unsigned long)_detectRuns]];
+                }
+                return;
+            }
+
+            _faceHits++;
             VNFeaturePrintObservation *print =
                 [FacePrint observationForFace:face pixelBuffer:pb logPrefix:@"app"];
-            if (!print) return;
+            if (!print) {
+                [self setHint:@"检测到人脸，但特征提取失败（再靠近一点）"];
+                return;
+            }
 
             NSDictionary *tmpl = [FacePrint templateForPrint:print];
             if (!tmpl) return;
             [_collected addObject:tmpl];
             NSUInteger n = _collected.count;
-            FUSLog(@"sample %lu/%lu collected", (unsigned long)n, (unsigned long)kSamples);
+            FUSLog(@"sample %lu/%lu collected (quality %.2f)",
+                   (unsigned long)n, (unsigned long)kSamples, q);
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (self->_finished) return;
                 self->_progressLabel.text = [NSString stringWithFormat:@"%lu / %lu",
