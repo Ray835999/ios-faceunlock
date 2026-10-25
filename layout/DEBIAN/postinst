@@ -1,14 +1,13 @@
 #!/bin/sh
-# FaceUnlock postinst
+# FaceUnlock postinst (v2.0.0)
 #
-# 1. dpkg installs bypass installd, so the companion app's icon will not appear
-#    on the home screen until uicache re-registers the app list. This is required
-#    for FaceUnlockSettings to show up (and for Settings > FaceUnlock to exist).
-# 2. Pre-create the app data dir owned by mobile. The app (running as mobile)
-#    creates it on demand anyway; doing it here with the right owner guarantees
-#    the diagnostic log and templates.plist are writable from the first launch.
-# 3. Arm the first-launch diagnostic popup (DEBUG_UI flag). The app deletes the
-#    flag when the user dismisses the alert, so it pops exactly once per install.
+# 1. dpkg bypasses installd, so the companion app icon will not appear until
+#    uicache re-registers the app list.
+# 2. Pre-create the shared data dir owned by mobile so the very first launch can
+#    write templates/telemetry without any permission dance.
+# 3. A reinstall means "new build, try again": clear the previous auto-disable
+#    markers so v2.0.0 gets a fair chance. The tweak's own crash-loop breaker
+#    will re-arm them if it really does destabilise SpringBoard.
 # Never fail the install because of any of this.
 if [ -x /var/jb/usr/bin/uicache ]; then
     /var/jb/usr/bin/uicache 2>/dev/null || true
@@ -19,6 +18,13 @@ fi
 APPDATA=/var/jb/var/mobile/Library/FaceUnlock
 mkdir -p "$APPDATA" 2>/dev/null || true
 chown mobile:mobile "$APPDATA" 2>/dev/null || true
-touch "$APPDATA/DEBUG_UI" 2>/dev/null || true
+chmod 755 "$APPDATA" 2>/dev/null || true
+
+# fresh start: drop stale state from earlier versions
+rm -f "$APPDATA/DISABLED"     2>/dev/null || true
+rm -f "$APPDATA/boot.plist"   2>/dev/null || true
+rm -f "$APPDATA/status.plist" 2>/dev/null || true
+rm -f "$APPDATA/tweak.log"    2>/dev/null || true
+rm -f "$APPDATA/app.log"      2>/dev/null || true
 
 exit 0

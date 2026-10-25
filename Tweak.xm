@@ -1,40 +1,50 @@
 //
-//  FaceUnlock — camera-based face unlock for Touch ID devices
-//  Target: iPhone 6s / iOS 15.8.x / rootless palera1n (Dopamine)
+//  FaceUnlock 2.0.0 — camera face unlock for Touch ID devices
+//  Target: iPhone 6s / iOS 15.8.x / rootless (Dopamine / palera1n)
 //
-//  Design (all private API access is runtime-guarded; nothing SpringBoard-
-//  related runs at load time):
-//   1. Lock screen appears -> start the front camera and run Vision face
-//      detection + feature print per frame (~3 fps) for a bounded window.
-//   2. Enrollment lives in the companion app (FaceUnlockSettings): it writes
-//      templates.plist and posts a Darwin notification so this tweak reloads
-//      the templates immediately.
-//   3. Match: min distance vs stored prints < threshold for 2 consecutive
-//      frames -> setAuthenticated:YES then
-//      SBLockScreenManager lockScreenViewControllerRequestsUnlock
-//      (the same unlock-completion call FastUnlockX uses).
+//  ===========================================================================
+//  WHY THIS IS A REWRITE (v1.x kept crashing SpringBoard or hanging the phone)
+//  ===========================================================================
+//  v1.x tried to be clever: a %ctor that "only logged", delayed setup, lazy
+//  framework loading, a hook on the lock-screen view controller. Every one of
+//  those was still a code path inside SpringBoard that could throw, block, or
+//  race. The user-visible result was either Safe Mode or a phone that stopped
+//  responding to touches (a hung SpringBoard looks exactly like "buttons don't
+//  work").
 //
-//  Crash-safety rules (Safe Mode post-mortem, v1.0.1 + v1.2.x):
-//   - %ctor must NOT touch SpringBoard singletons, register notifications, or
-//     call any API beyond a single NSLog. Tweaks are loaded at dyld time,
-//     before SpringBoard is initialized; setUp() is deferred to the first
-//     lock-screen appearance.
-//   - Vision / AVFoundation / CoreMedia / CoreVideo are WEAK-LINKED and end up
-//     with NO load command in this dylib at all, so dyld loads nothing
-//     framework-related when injecting into SpringBoard. They are dlopen()ed at
-//     runtime from setUp() (after SpringBoard is initialized) and every class
-//     is resolved with NSClassFromString / every extern constant NULL-checked,
-//     so a framework that fails to load logs one line and disables the feature
-//     instead of killing the process.
-//   - Every hook body and the entire capture pipeline is wrapped in
-//     @try/@catch: an NSException escaping into SpringBoard is a crash.
-//   - AVCaptureSession is owned by the capture queue; the main thread only
-//     flips BOOL gates. A session generation counter prevents a stale
-//     teardown from clearing a freshly started session's gates.
-//   - Templates are mutated on the capture queue and read on the main thread,
-//     so every access is @synchronized.
-//   - Kill switch: create /var/jb/var/mobile/Library/FaceUnlock/DISABLED to
-//     stop all hook activity without uninstalling.
+//  v2.0.0 takes the opposite approach — assume this process is hostile:
+//
+//   1. BOOT-LOOP CIRCUIT BREAKER. %ctor increments a counter file. If the tweak
+//      has been loaded 4+ times inside 120 s (i.e. SpringBoard is crash-looping
+//      because of us), it writes the DISABLED kill switch and hooks NOTHING.
+//      This is what makes "一会崩溃" self-healing: worst case one bad boot, then
+//      the tweak disables itself instead of pushing the device into Safe Mode.
+//
+//   2. NO FRAMEWORK SYMBOLS AT ALL. Every AVFoundation / CoreVideo / Vision
+//      constant is replaced by its literal value ("vide", "PixelFormatType",
+//      0x42475241, ...). Nothing extern is referenced, so this dylib carries no
+//      strong symbol references into frameworks that might not be loadable
+//      inside SpringBoard, and nothing can be NULL at runtime.
+//
+//   3. LAZY EVERYTHING. %ctor does not touch SpringBoard, does not register
+//      notifications, does not dlopen. Setup happens 3 s later on the main
+//      queue, and the frameworks are only dlopen()ed the first time a scan is
+//      actually needed.
+//
+//   4. NO-FRAME WATCHDOG. A capture session that never delivers frames is the
+//      classic "phone is stuck" scenario. 3 s after start, if zero frames
+//      arrived, the session is torn down on its own queue and the failure is
+//      counted. Three failures in a row => auto-disable (kill switch), so the
+//      phone can never be left holding a wedged camera session.
+//
+//   5. EVERY ESCAPE IS CONTAINED. Hook bodies, session setup, frame analysis,
+//      unlock — each has @try/@catch and a bounded timeout.
+//
+//   6. TELEMETRY INSTEAD OF LOG SCRAPING. Everything observable is written to
+//      status.plist, which the companion app displays on screen. The user never
+//      has to run a console command to tell us what happened.
+//
+//  Everything SpringBoard-visible is guarded by FU_OK() kill switches.
 //
 
 #import <Foundation/Foundation.h>
@@ -43,340 +53,550 @@
 #import <Vision/Vision.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreImage/CoreImage.h>
-#import <math.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <notify.h>
 #import <dlfcn.h>
+#import <math.h>
 
 #import "FacePrint.h"
 
-#define FU_LOG(fmt, ...) NSLog(@"[FaceUnlock] " fmt, ##__VA_ARGS__)
-
-static NSString *const kPrefsAppID = @"com.ray835999.faceunlock";
-
-// Darwin notification posted by FaceUnlockSettings after enrollment changes.
-static NSString *const kTemplatesChangedNotify =
-    @"com.ray835999.faceunlock.templates-changed";
-
-// Touch this file to disable the tweak at runtime (no uninstall needed).
-static NSString *const kKillSwitchPath =
-    @"/var/jb/var/mobile/Library/FaceUnlock/DISABLED";
-
-static const NSTimeInterval kScanWindow        = 12.0;  // auto-stop without a match
-static const NSTimeInterval kAnalysisInterval  = 0.35;  // ~3 fps
-static const NSTimeInterval kLogInterval       = 2.0;
-static const NSUInteger    kRequiredConsecutive = 2;
-
 // ---------------------------------------------------------------------------
-// prefs (plist at /var/jb/var/mobile/Library/Preferences/<appid>.plist)
+// shared paths
 // ---------------------------------------------------------------------------
-static BOOL FUPrefBool(NSString *key, BOOL def) {
-    CFPropertyListRef v = CFPreferencesCopyAppValue((CFStringRef)key, (CFStringRef)kPrefsAppID);
-    if (!v) return def;
-    BOOL b = def;
-    CFTypeID t = CFGetTypeID(v);
-    if (t == CFBooleanGetTypeID() || t == CFNumberGetTypeID()) b = [(__bridge NSNumber *)v boolValue];
-    CFRelease(v);
-    return b;
-}
-static float FUPrefFloat(NSString *key, float def) {
-    CFPropertyListRef v = CFPreferencesCopyAppValue((CFStringRef)key, (CFStringRef)kPrefsAppID);
-    if (!v) return def;
-    float f = def;
-    CFTypeID t = CFGetTypeID(v);
-    if (t == CFBooleanGetTypeID() || t == CFNumberGetTypeID()) f = [(__bridge NSNumber *)v floatValue];
-    CFRelease(v);
-    return f;
+#define FU_DIR @"/var/jb/var/mobile/Library/FaceUnlock"
+
+static NSString *FUPath(NSString *name) {
+    return [FU_DIR stringByAppendingPathComponent:name];
 }
 
-// AVFoundation classes, resolved at runtime (weak framework in the tweak).
-static Class FUAV(NSString *name) { return NSClassFromString(name); }
-
-// The tweak does NOT carry load commands for these frameworks (weak link, no
-// strong symbol references), so dyld loads nothing framework-related at
-// injection time. They are dlopen()ed at runtime instead — after SpringBoard is
-// initialized — so a broken/missing framework disables the feature with a log
-// line instead of killing the process.
-static void FULoadOptionalFrameworks(void) {
-    @autoreleasepool {
-        void *cm = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
-        FU_LOG("dlopen CoreMedia: %s", cm ? "ok" : (dlerror() ?: "failed"));
-        void *av = dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
-        FU_LOG("dlopen AVFoundation: %s", av ? "ok" : (dlerror() ?: "failed"));
-        void *vi = dlopen("/System/Library/Frameworks/Vision.framework/Vision", RTLD_LAZY);
-        FU_LOG("dlopen Vision: %s", vi ? "ok" : (dlerror() ?: "failed"));
+static void FULogAppend(NSString *msg) {
+    static NSObject *lock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    @synchronized (lock) {
+        @try {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            [fm createDirectoryAtPath:FU_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *p = FUPath(@"tweak.log");
+            NSDictionary *at = [fm attributesOfItemAtPath:p error:nil];
+            if (at && [at fileSize] > 96 * 1024) { [fm removeItemAtPath:p error:nil]; at = nil; }
+            if (!at) [fm createFileAtPath:p contents:nil attributes:nil];
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (!fh) return;
+            NSDateFormatter *df = [NSDateFormatter new];
+            df.dateFormat = @"HH:mm:ss.SSS";
+            NSString *line = [NSString stringWithFormat:@"%@ %@\n", [df stringFromDate:[NSDate date]], msg ?: @""];
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } @catch (NSException *e) {
+            // logging must never throw into the host
+        }
     }
 }
 
-// True when AVFoundation + the constants the capture path needs are present.
-// (Weak-linked extern NSString constants are NULL when the framework is absent.)
-static BOOL FUAVFoundationAvailable(void) {
-    return (FUAV(@"AVCaptureDevice") != nil
-         && FUAV(@"AVCaptureDeviceInput") != nil
-         && FUAV(@"AVCaptureSession") != nil
-         && FUAV(@"AVCaptureVideoDataOutput") != nil
-         && FUAV(@"AVCaptureConnection") != nil
-         && FUAV(@"AVCaptureDeviceDiscoverySession") != nil
-         && AVCaptureDeviceTypeBuiltInWideAngleCamera != NULL
-         && AVMediaTypeVideo != NULL
-         && AVCaptureSessionPreset640x480 != NULL
-         && kCVPixelBufferPixelFormatTypeKey != NULL);
+#define FU_LOG(fmt, ...) do { \
+    NSString *_fu_m = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
+    NSLog(@"[FaceUnlock] %@", _fu_m); \
+    FULogAppend(_fu_m); \
+} while (0)
+
+// ---------------------------------------------------------------------------
+// telemetry (status.plist) — the app renders this on screen
+// ---------------------------------------------------------------------------
+static NSMutableDictionary *gStatus = nil;
+static NSObject *gStatusLock = nil;
+static NSTimeInterval gLastFlush = 0;
+
+static void FUStatusFlush(BOOL force) {
+    @try {
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if (!force && now - gLastFlush < 1.0) return;
+        gLastFlush = now;
+        NSDictionary *snapshot = nil;
+        @synchronized (gStatusLock) {
+            NSMutableDictionary *d = [gStatus mutableCopy];
+            d[@"updated"] = [NSDate date];
+            d[@"updatedEpoch"] = @(now);
+            snapshot = d;
+        }
+        [snapshot writeToFile:FUPath(@"status.plist") atomically:YES];
+    } @catch (NSException *e) {
+        // never throw
+    }
+}
+
+static void FUStatusSet(NSString *key, id value) {
+    @try {
+        @synchronized (gStatusLock) {
+            if (!gStatus) return;
+            if (value) gStatus[key] = value;
+            else        [gStatus removeObjectForKey:key];
+        }
+        FUStatusFlush(NO);
+    } @catch (NSException *e) {
+        // never throw
+    }
+}
+
+static void FUStatusAdd(NSString *key, long long delta) {
+    @try {
+        @synchronized (gStatusLock) {
+            if (!gStatus) return;
+            long long v = [gStatus[key] longLongValue] + delta;
+            gStatus[key] = @(v);
+        }
+        FUStatusFlush(NO);
+    } @catch (NSException *e) {
+        // never throw
+    }
+}
+
+// ---------------------------------------------------------------------------
+// kill switch + circuit breaker
+// ---------------------------------------------------------------------------
+static BOOL FUKillSwitch(void) {
+    @try {
+        return [[NSFileManager defaultManager] fileExistsAtPath:FUPath(@"DISABLED")];
+    } @catch (NSException *e) { return YES; }
+}
+
+static void FUKillSwitchEngage(NSString *why) {
+    @try {
+        [[NSFileManager defaultManager] createDirectoryAtPath:FU_DIR
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        [why writeToFile:FUPath(@"DISABLED") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (NSException *e) {}
+}
+
+// Returns YES when the tweak must stay completely inert this boot.
+// Writes DISABLED when it detects a crash loop caused by us.
+static BOOL FUBootGuard(void) {
+    @try {
+        NSString *p = FUPath(@"boot.plist");
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        double first = [d[@"first"] doubleValue];
+        int count = [d[@"count"] intValue];
+        if (first <= 0 || (now - first) > 120.0) { first = now; count = 0; }
+        count++;
+        NSDictionary *out = @{ @"first": @(first), @"count": @(count), @"last": @(now) };
+        [[NSFileManager defaultManager] createDirectoryAtPath:FU_DIR
+                                 withIntermediateDirectories:YES attributes:nil error:nil];
+        [out writeToFile:p atomically:YES];
+        if (count >= 4) {
+            FUKillSwitchEngage(@"auto-disabled: tweak loaded 4 times within 120s (SpringBoard was crash-looping)\n"
+                               @"delete this file after fixing / or press 急停 in the app to re-enable");
+            return YES;
+        }
+        return NO;
+    } @catch (NSException *e) {
+        return YES;   // when in doubt, do nothing
+    }
+}
+
+// ---------------------------------------------------------------------------
+// framework availability (all runtime, zero extern symbols)
+// ---------------------------------------------------------------------------
+static Class FUClass(NSString *name) {
+    @try { return NSClassFromString(name); } @catch (NSException *e) { return Nil; }
+}
+
+static BOOL gFrameworksTried = NO;
+static BOOL gAVOK = NO;
+static BOOL gVisionOK = NO;
+
+static void FULoadFrameworksOnce(void) {
+    if (gFrameworksTried) return;
+    gFrameworksTried = YES;
+    @try {
+        void *av = dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
+        void *cv = dlopen("/System/Library/Frameworks/CoreVideo.framework/CoreVideo", RTLD_LAZY);
+        void *vi = dlopen("/System/Library/Frameworks/Vision.framework/Vision", RTLD_LAZY);
+        FU_LOG("dlopen AVFoundation=%s CoreVideo=%s Vision=%s",
+               av ? "ok" : "FAIL", cv ? "ok" : "FAIL", vi ? "ok" : "FAIL");
+        gAVOK = (FUClass(@"AVCaptureSession") != Nil &&
+                 FUClass(@"AVCaptureDevice") != Nil &&
+                 FUClass(@"AVCaptureDeviceInput") != Nil &&
+                 FUClass(@"AVCaptureVideoDataOutput") != Nil &&
+                 FUClass(@"AVCaptureVideoDataOutput") != Nil);
+        gVisionOK = [FacePrint visionAvailable];
+        FUStatusSet(@"avOK", @(gAVOK));
+        FUStatusSet(@"visionOK", @(gVisionOK));
+        if (!gAVOK)     FU_LOG("AVFoundation classes unavailable in SpringBoard");
+        if (!gVisionOK) FU_LOG("Vision unavailable in SpringBoard");
+    } @catch (NSException *e) {
+        FU_LOG("framework load exception: %@", e.reason);
+        gAVOK = NO; gVisionOK = NO;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // manager
 // ---------------------------------------------------------------------------
 @interface FaceUnlockManager : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
-
-@property (nonatomic, weak)   id       dashBoardVC;
-@property (nonatomic, assign) BOOL     faceUnlockInProgress;
-@property (nonatomic, assign) BOOL     deviceLocked;
-
-+ (instancetype)sharedManager;
-- (void)setUp;
-- (void)reloadTemplates;
-- (void)lockScreenDidAppear;
+@property (nonatomic, weak) id lockScreenVC;
++ (instancetype)shared;
+- (void)start;                     // main thread, 3 s after load
+- (void)noteLockScreenAppeared:(id)vc;
 - (void)noteDeviceLocked;
-- (void)completeFaceUnlock;
-
-- (BOOL)enabled;
-- (float)threshold;
-
+- (void)stopScanning;
 @end
 
+static const NSTimeInterval kScanWindow       = 10.0;
+static const NSTimeInterval kAnalysisInterval = 0.30;
+static const NSTimeInterval kNoFrameTimeout   = 3.0;
+static const NSUInteger    kRequiredMatches   = 2;
+static const int           kMaxCameraFailures = 3;
+
 @implementation FaceUnlockManager {
-    // main-thread state
-    BOOL               _sessionActive;   // a scan session is armed
-    BOOL               _analyzing;       // frames are being processed (gate)
-    NSUInteger         _sessionGen;      // generation of the armed session
+    // main thread
+    BOOL             _started;
+    BOOL             _armed;
+    NSUInteger       _gen;
+    BOOL             _unlocking;
 
-    // capture-queue-only state
-    dispatch_queue_t   _captureQueue;
-    AVCaptureSession  *_session;
-    NSUInteger         _runningGen;      // generation of the live session
-    NSMutableArray    *_templates;
-    NSDate            *_lastAnalysis;
-    NSDate            *_scanDeadline;
-    NSTimeInterval     _lastLog;
-    NSUInteger         _consecutive;
-    float              _sessionBest;
+    // capture queue
+    dispatch_queue_t _q;
+    AVCaptureSession *_session;
+    NSUInteger       _runGen;
+    NSDate          *_lastAnalysis;
+    NSDate          *_deadline;
+    NSUInteger       _frames;
+    NSUInteger       _consecutive;
+    float            _best;
+    long long        _failStreak;
+    NSTimeInterval   _lastLog;
 
-    // shared state
-    id                 _templatesLock;
-    BOOL               _setUpDone;
-    BOOL               _passcodeSet;
-    BOOL               _notifyRegistered;
+    // shared
+    NSObject        *_tplLock;
+    NSArray         *_templates;
+    BOOL             _passcodeSet;
 }
 
-+ (instancetype)sharedManager {
++ (instancetype)shared {
     static FaceUnlockManager *m;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ m = [FaceUnlockManager new]; });
+    dispatch_once(&once, ^{
+        gStatusLock = [NSObject new];
+        gStatus = [NSMutableDictionary dictionary];
+        m = [FaceUnlockManager new];
+    });
     return m;
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
-        _captureQueue  = dispatch_queue_create("com.ray835999.faceunlock.capture", DISPATCH_QUEUE_SERIAL);
-        _templates     = [NSMutableArray array];
-        _templatesLock = [NSObject new];
-        _passcodeSet   = YES;
+        _q        = dispatch_queue_create("com.ray835999.faceunlock.capture", DISPATCH_QUEUE_SERIAL);
+        _tplLock  = [NSObject new];
+        _templates = @[];
+        _best     = INFINITY;
     }
     return self;
 }
 
-static BOOL FUKillSwitchEngaged(void) {
-    return [[NSFileManager defaultManager] fileExistsAtPath:kKillSwitchPath];
+#pragma mark - prefs
+static BOOL FUPrefBool(NSString *key, BOOL def) {
+    @try {
+        CFPropertyListRef v = CFPreferencesCopyAppValue((CFStringRef)key,
+                                                        CFSTR("com.ray835999.faceunlock"));
+        if (!v) return def;
+        BOOL b = def;
+        CFTypeID t = CFGetTypeID(v);
+        if (t == CFBooleanGetTypeID() || t == CFNumberGetTypeID()) {
+            b = [(__bridge NSNumber *)v boolValue];
+        }
+        CFRelease(v);
+        return b;
+    } @catch (NSException *e) { return def; }
 }
 
-// Deferred from %ctor on purpose: this touches SpringBoard singletons and
-// Darwin notifications, and is only safe once SpringBoard is fully initialized
-// (first lock-screen appearance).
-- (void)setUp {
-    if (_setUpDone) return;
-    _setUpDone = YES;
-    [self reloadTemplates];
+static float FUPrefFloat(NSString *key, float def) {
+    @try {
+        CFPropertyListRef v = CFPreferencesCopyAppValue((CFStringRef)key,
+                                                        CFSTR("com.ray835999.faceunlock"));
+        if (!v) return def;
+        float f = def;
+        CFTypeID t = CFGetTypeID(v);
+        if (t == CFBooleanGetTypeID() || t == CFNumberGetTypeID()) {
+            f = [(__bridge NSNumber *)v floatValue];
+        }
+        CFRelease(v);
+        return f;
+    } @catch (NSException *e) { return def; }
+}
 
-    // hot-reload templates when FaceUnlockSettings changes enrollment.
-    // Registered here (not in %ctor): notify_register_dispatch is only safe
-    // after the host process is initialized.
-    if (!_notifyRegistered) {
-        _notifyRegistered = YES;
-        notify_register_dispatch(kTemplatesChangedNotify.UTF8String, NULL,
-                                 dispatch_get_main_queue(), ^(int token) {
-            [[FaceUnlockManager sharedManager] reloadTemplates];
+- (BOOL)enabled    { return FUPrefBool(@"Enabled", YES); }
+- (float)threshold { return FUPrefFloat(@"Threshold", 0.55f); }
+
+#pragma mark - startup (3 s after injection: SpringBoard is long since up)
+- (void)start {
+    if (_started) return;
+    _started = YES;
+    @try {
+        NSDictionary *bundle = [[NSBundle mainBundle] infoDictionary];
+        FUStatusSet(@"hostUp", @YES);
+        FUStatusSet(@"version", @"2.0.0");
+        FUStatusSet(@"hostVersion", bundle[@"CFBundleVersion"] ?: @"?");
+        FUStatusSet(@"device", [[UIDevice currentDevice] systemVersion]);
+        FUStatusSet(@"state", @"idle");
+
+        BOOL killed = FUKillSwitch();
+        FUStatusSet(@"killSwitch", @(killed));
+        if (killed) {
+            FU_LOG("kill switch present - standing down (delete %@/DISABLED to re-enable)",
+                   FU_DIR);
+            FUStatusSet(@"state", @"disabled (kill switch)");
+            FUStatusFlush(YES);
+            return;
+        }
+
+        id mgr = [FUClass(@"SBLockScreenManager") sharedInstance];
+        if (mgr && [mgr respondsToSelector:@selector(isPasscodeSet)]) {
+            _passcodeSet = ((BOOL (*)(id, SEL))objc_msgSend)(mgr, @selector(isPasscodeSet));
+        } else {
+            _passcodeSet = YES;   // unknown: try anyway
+        }
+        FUStatusSet(@"passcodeSet", @(_passcodeSet));
+
+        [self reloadTemplates];
+
+        int token = 0;
+        notify_register_dispatch("com.apple.springboard.lockcomplete", &token,
+                                 dispatch_get_main_queue(), ^(int t) {
+            @autoreleasepool {
+                @try { [[FaceUnlockManager shared] noteDeviceLocked]; }
+                @catch (NSException *e) { FU_LOG("lockcomplete handler: %@", e.reason); }
+            }
         });
+        FU_LOG("ready: enabled=%d threshold=%.2f templates=%lu passcodeSet=%d killSwitch=0",
+               self.enabled, self.threshold, (unsigned long)[self templateCount], _passcodeSet);
+        FUStatusSet(@"ready", @YES);
+        FUStatusFlush(YES);
+    } @catch (NSException *e) {
+        FU_LOG("start exception: %@", e.reason);
     }
+}
 
-    // Runtime-load the optional frameworks (they are NOT linked into this
-    // dylib, so nothing framework-related can fail at dyld load time).
-    FULoadOptionalFrameworks();
-
-    BOOL passcode = YES;
-    id lockMgr = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
-    if (lockMgr && [lockMgr respondsToSelector:@selector(isPasscodeSet)]) {
-        passcode = ((BOOL (*)(id, SEL))objc_msgSend)(lockMgr, @selector(isPasscodeSet));
-    }
-    _passcodeSet = passcode;
-    NSUInteger enrolled = 0;
-    @synchronized (_templatesLock) { enrolled = _templates.count; }
-    FU_LOG("loaded: enabled=%d threshold=%.3f enrolled=%lu passcodeSet=%d vision=%d avfoundation=%d",
-           FUPrefBool(@"Enabled", YES), FUPrefFloat(@"Threshold", 0.5),
-           (unsigned long)enrolled, passcode,
-           [FacePrint visionAvailable], FUAVFoundationAvailable());
-    if (!FUPrefBool(@"Enabled", YES)) FU_LOG("tweak disabled via prefs (Enabled=NO)");
-    if (![FacePrint visionAvailable])   FU_LOG("Vision unavailable in this process - face unlock disabled");
-    if (!FUAVFoundationAvailable())     FU_LOG("AVFoundation unavailable in this process - face unlock disabled");
-    if (!passcode) FU_LOG("no lock screen passcode set - face unlock needs a passcode (same as Vizage)");
-    if (enrolled == 0) FU_LOG("no faceprints yet - enroll in the FaceUnlockSettings app");
+- (NSUInteger)templateCount {
+    @synchronized (_tplLock) { return _templates.count; }
 }
 
 - (void)reloadTemplates {
-    NSArray *t = [FacePrint loadTemplates];
-    @synchronized (_templatesLock) {
-        [_templates setArray:t];
-    }
-    FU_LOG("templates reloaded: %lu", (unsigned long)t.count);
-}
-
-#pragma mark - prefs
-- (BOOL)enabled    { return FUPrefBool(@"Enabled", YES); }
-- (float)threshold { return FUPrefFloat(@"Threshold", 0.5); }
-
-#pragma mark - scan session lifecycle
-// main thread: arm/disarm gates only; the session itself lives on _captureQueue
-- (void)startScanning {
-    if (_sessionActive) return;
-    if (FUKillSwitchEngaged())      { FU_LOG("startScanning: DISABLED kill switch present"); return; }
-    if (!self.enabled)              { FU_LOG("startScanning: disabled by prefs"); return; }
-    if (!_passcodeSet)              { return; }   // nothing to unlock without a passcode
-    if (![FacePrint visionAvailable])   { return; }
-    if (!FUAVFoundationAvailable())     { return; }
-
-    NSUInteger enrolled = 0;
-    @synchronized (_templatesLock) { enrolled = _templates.count; }
-    if (enrolled == 0) {
-        FU_LOG("startScanning: no faceprints yet - enroll in the FaceUnlockSettings app");
-        return;
-    }
-
-    _sessionGen++;
-    _sessionActive = YES;
-    _analyzing     = YES;
-    NSUInteger gen = _sessionGen;
-    dispatch_async(_captureQueue, ^{
-        @autoreleasepool { [self setupAndRunSessionGen:gen]; }
-    });
-}
-
-// any thread: flip the frame gate now, tear the session down on its own queue
-- (void)stopScanning {
-    _analyzing = NO;
-    if (!_sessionActive) return;
-    _sessionActive = NO;
-    dispatch_async(_captureQueue, ^{
-        @autoreleasepool { [self finishSessionOnQueue]; }
-    });
-}
-
-// capture queue only: create + start the session (or log why we cannot)
-- (void)setupAndRunSessionGen:(NSUInteger)gen {
     @try {
-        if (!FUAVFoundationAvailable()) {
-            FU_LOG("startScanning: AVFoundation unavailable - face unlock disabled");
-            [self finishSessionOnQueue];
-            return;
-        }
-
-        // Log the camera authorization state: in a process without camera
-        // entitlement (e.g. SpringBoard) this shows up as notDetermined and
-        // the session will simply never deliver frames.
-        @try {
-            AVAuthorizationStatus st =
-                ((AVAuthorizationStatus (*)(id, SEL, id))objc_msgSend)(
-                    FUAV(@"AVCaptureDevice"), @selector(authorizationStatusForMediaType:),
-                    (id)AVMediaTypeVideo);
-            FU_LOG("camera authorization status: %ld", (long)st);
-        } @catch (NSException *ex) {
-            FU_LOG("camera authorization probe failed: %@", ex.reason);
-        }
-
-        AVCaptureDeviceDiscoverySession *disc =
-            [(id)FUAV(@"AVCaptureDeviceDiscoverySession")
-                discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
-                                      mediaType:AVMediaTypeVideo
-                                       position:AVCaptureDevicePositionFront];
-        AVCaptureDevice *cam = disc.devices.firstObject;
-        if (!cam) { FU_LOG("startScanning: no front camera found"); [self finishSessionOnQueue]; return; }
-
-        NSError *err = nil;
-        AVCaptureDeviceInput *input =
-            [(id)FUAV(@"AVCaptureDeviceInput") deviceInputWithDevice:cam error:&err];
-        if (!input) {
-            FU_LOG("startScanning: camera input error: %@", err.localizedDescription ?: @"?");
-            [self finishSessionOnQueue];
-            return;
-        }
-
-        AVCaptureSession *session = [(id)FUAV(@"AVCaptureSession") new];
-        session.sessionPreset = AVCaptureSessionPreset640x480;
-        if (![session canAddInput:input]) { FU_LOG("startScanning: cannot add camera input"); [self finishSessionOnQueue]; return; }
-        [session addInput:input];
-
-        AVCaptureVideoDataOutput *out = [(id)FUAV(@"AVCaptureVideoDataOutput") new];
-        out.alwaysDiscardsLateVideoFrames = YES;
-        out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
-        [out setSampleBufferDelegate:self queue:_captureQueue];
-        if (![session canAddOutput:out]) { FU_LOG("startScanning: cannot add video output"); [self finishSessionOnQueue]; return; }
-        [session addOutput:out];
-        AVCaptureConnection *conn = [out connectionWithMediaType:AVMediaTypeVideo];
-        if (conn.supportsVideoOrientation) conn.videoOrientation = AVCaptureVideoOrientationPortrait;
-
-        _consecutive  = 0;
-        _sessionBest  = INFINITY;
-        _scanDeadline = [NSDate dateWithTimeIntervalSinceNow:kScanWindow];
-        _runningGen   = gen;
-        _session      = session;
-        [session startRunning];
-        FU_LOG("scanning started (MATCH mode, window=%.0fs)", kScanWindow);
-    } @catch (NSException *ex) {
-        FU_LOG("session setup exception: %@", ex.reason);
-        [self finishSessionOnQueue];
+        NSArray *t = [FacePrint loadTemplates];
+        @synchronized (_tplLock) { _templates = t ?: @[]; }
+        FUStatusSet(@"templates", @([self templateCount]));
+        FU_LOG("templates loaded: %lu", (unsigned long)[self templateCount]);
+    } @catch (NSException *e) {
+        FU_LOG("reloadTemplates: %@", e.reason);
     }
 }
 
-// capture queue only: stop + drop the live session, then clear the main-thread
-// gates — but only if the session we just tore down is still the armed one.
-- (void)finishSessionOnQueue {
-    if (_sessionBest != INFINITY) {
-        FU_LOG("scan session best distance=%.3f (threshold=%.3f)", _sessionBest, self.threshold);
-        _sessionBest = INFINITY;
+#pragma mark - triggers
+- (void)noteLockScreenAppeared:(id)vc {
+    @try {
+        if (vc) self.lockScreenVC = vc;
+        FUStatusSet(@"lockScreenVC", vc ? NSStringFromClass([vc class]) : @"none");
+        [self noteDeviceLocked];
+    } @catch (NSException *e) {
+        FU_LOG("noteLockScreenAppeared: %@", e.reason);
     }
-    if (_session) {
-        [_session stopRunning];
-        _session = nil;
-    }
-    NSUInteger gen = _runningGen;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self->_sessionGen == gen) {
-            self->_sessionActive = NO;
-            self->_analyzing     = NO;
-        }
-    });
 }
 
-#pragma mark - AVCaptureVideoDataOutputSampleBufferDelegate
-- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-      fromConnection:(AVCaptureConnection *)connection {
+- (void)noteDeviceLocked {
+    @try {
+        if (FUKillSwitch()) { FUStatusSet(@"state", @"disabled (kill switch)"); return; }
+        if (!self.enabled)  { FUStatusSet(@"state", @"disabled (pref)"); return; }
+        // templates may have been enrolled/changed since the last lock
+        if ([self templateCount] == 0) [self reloadTemplates];
+        if ([self templateCount] == 0) {
+            FUStatusSet(@"state", @"no templates - enroll in the FaceUnlock app");
+            FU_LOG("locked, but no templates enrolled");
+            return;
+        }
+        [self startScanning];
+    } @catch (NSException *e) {
+        FU_LOG("noteDeviceLocked: %@", e.reason);
+    }
+}
+
+#pragma mark - scan lifecycle
+- (void)startScanning {
+    if (_armed) return;
+    @try {
+        FULoadFrameworksOnce();
+        if (!gAVOK)    { FUStatusSet(@"state", @"no AVFoundation"); return; }
+        if (!gVisionOK){ FUStatusSet(@"state", @"no Vision"); return; }
+        if (_passcodeSet == NO) {
+            FUStatusSet(@"state", @"no passcode - nothing to unlock");
+            FU_LOG("no passcode set; face unlock is pointless");
+            return;
+        }
+        if ([self templateCount] == 0) return;
+
+        _gen++;
+        _armed = YES;
+        NSUInteger gen = _gen;
+        FUStatusSet(@"state", @"scanning");
+        FUStatusAdd(@"sessions", 1);
+        FU_LOG("lock detected -> arming scan #%lu", (unsigned long)gen);
+
+        dispatch_async(_q, ^{ @autoreleasepool { [self runSessionGen:gen]; } });
+    } @catch (NSException *e) {
+        FU_LOG("startScanning: %@", e.reason);
+        FUStatusSet(@"state", @"error starting");
+    }
+}
+
+- (void)stopScanning {
+    if (!_armed) return;
+    _armed = NO;
+    dispatch_async(_q, ^{ @autoreleasepool { [self teardown]; } });
+}
+
+// capture queue only
+- (void)teardown {
+    @try {
+        if (_session) {
+            [_session stopRunning];
+            _session = nil;
+        }
+    } @catch (NSException *e) {
+        FU_LOG("teardown: %@", e.reason);
+    }
+    _deadline = nil;
+}
+
+// capture queue only
+- (void)runSessionGen:(NSUInteger)gen {
     @autoreleasepool {
         @try {
-            if (!_analyzing || !_session) return;
+            // authorization state (informational; never call requestAccess here:
+            // an alert on top of the lock screen is exactly how v1.x hung)
+            @try {
+                AVAuthorizationStatus st =
+                    ((AVAuthorizationStatus (*)(id, SEL, NSString *))objc_msgSend)(
+                        FUClass(@"AVCaptureDevice"),
+                        @selector(authorizationStatusForMediaType:), @"vide");
+                FUStatusSet(@"cameraAuth", @(st));
+                FU_LOG("camera authorization: %ld (0=notDetermined 1=restricted 2=denied 3=authorized)",
+                       (long)st);
+            } @catch (NSException *e) {}
+
+            id discCls = FUClass(@"AVCaptureDeviceDiscoverySession");
+            id disc = ((id (*)(id, SEL, NSArray *, NSString *, long))objc_msgSend)(
+                discCls, @selector(discoverySessionWithDeviceTypes:mediaType:position:),
+                @[@"AVCaptureDeviceTypeBuiltInWideAngleCamera"], @"vide", 2L /* front */);
+            NSArray *devices = disc ? [disc valueForKey:@"devices"] : nil;
+            id cam = [devices isKindOfClass:[NSArray class]] ? [devices firstObject] : nil;
+            if (!cam) { [self failWith:@"no front camera found"]; return; }
+
+            NSError *err = nil;
+            id input = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(
+                FUClass(@"AVCaptureDeviceInput"), @selector(deviceInputWithDevice:error:), cam, &err);
+            if (!input) { [self failWith:[NSString stringWithFormat:@"camera input: %@",
+                                         err.localizedDescription ?: @"?"]]; return; }
+
+            AVCaptureSession *session = [(id)FUClass(@"AVCaptureSession") new];
+            session.sessionPreset = @"AVCaptureSessionPreset640x480";
+            if (![session canAddInput:input]) { [self failWith:@"cannot add camera input"]; return; }
+            [session addInput:input];
+
+            AVCaptureVideoDataOutput *out = [(id)FUClass(@"AVCaptureVideoDataOutput") new];
+            out.alwaysDiscardsLateVideoFrames = YES;
+            // literal "PixelFormatType" / 'BGRA' instead of the CoreVideo externs
+            out.videoSettings = @{ @"PixelFormatType": @(0x42475241u) };
+            [out setSampleBufferDelegate:self queue:_q];
+            if (![session canAddOutput:out]) { [self failWith:@"cannot add video output"]; return; }
+            [session addOutput:out];
+
+            @try {
+                AVCaptureConnection *conn = [out connectionWithMediaType:@"vide"];
+                if (conn && conn.supportsVideoOrientation) {
+                    conn.videoOrientation = AVCaptureVideoOrientationPortrait;
+                }
+            } @catch (NSException *e) {}
+
+            _frames      = 0;
+            _consecutive = 0;
+            _best        = INFINITY;
+            _lastAnalysis = nil;
+            _deadline    = [NSDate dateWithTimeIntervalSinceNow:kScanWindow];
+            _runGen      = gen;
+            _session     = session;
+
+            [session startRunning];
+            FU_LOG("session started (gen %lu, window %.0fs)", (unsigned long)gen, kScanWindow);
+
+            // watchdog: a session that never delivers frames is the classic
+            // "phone is stuck holding the camera" case
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(kNoFrameTimeout * NSEC_PER_SEC)),
+                           _q, ^{
+                @autoreleasepool {
+                    if (gen != self->_runGen) return;
+                    if (self->_frames > 0) return;
+                    FU_LOG("WATCHDOG: 0 frames in %.0fs - tearing the session down", kNoFrameTimeout);
+                    FUStatusSet(@"state", @"no frames (camera not delivering)");
+                    [self teardown];
+                    [self countCameraFailure];
+                }
+            });
+        } @catch (NSException *e) {
+            FU_LOG("runSession exception: %@", e.reason);
+            [self failWith:[NSString stringWithFormat:@"session: %@", e.reason ?: @"?"]];
+        }
+    }
+}
+
+// capture queue only
+- (void)failWith:(NSString *)why {
+    FU_LOG("camera failure: %@", why);
+    FUStatusSet(@"lastError", why);
+    FUStatusSet(@"state", why);
+    [self teardown];
+    [self countCameraFailure];
+}
+
+// capture queue only
+- (void)countCameraFailure {
+    _failStreak++;
+    FUStatusSet(@"cameraFailures", @(_failStreak));
+    if (_failStreak >= kMaxCameraFailures) {
+        FU_LOG("camera failed %d times in a row - auto-disabling so the phone stays usable",
+               kMaxCameraFailures);
+        FUKillSwitchEngage(@"auto-disabled: the camera could not be started inside SpringBoard "
+                           @"(SpringBoard likely has no camera permission).\n"
+                           @"Open the FaceUnlock app and press 重新启用 after checking.");
+        FUStatusSet(@"killSwitch", @YES);
+        FUStatusSet(@"state", @"auto-disabled (camera unavailable in SpringBoard)");
+        FUStatusFlush(YES);
+    }
+}
+
+#pragma mark - frames
+- (void)captureOutput:(AVCaptureOutput *)output
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+       fromConnection:(AVCaptureConnection *)connection {
+    @autoreleasepool {
+        @try {
+            _frames++;
+            if (_frames == 1) {
+                FU_LOG("first frame received - camera is live in SpringBoard");
+                FUStatusSet(@"state", @"scanning (frames arriving)");
+                FUStatusAdd(@"frameSessions", 1);
+            }
+            if (!_armed || !_session) return;
+
             NSDate *now = [NSDate date];
             if (_lastAnalysis && [now timeIntervalSinceDate:_lastAnalysis] < kAnalysisInterval) return;
             _lastAnalysis = now;
-            if ([now timeIntervalSinceDate:_scanDeadline] > 0) {
+            if (_deadline && [now timeIntervalSinceDate:_deadline] > 0) {
+                FU_LOG("scan window expired (best=%.3f)", _best);
                 [self stopScanning];
+                FUStatusSet(@"state", @"idle (window expired)");
                 return;
             }
 
@@ -385,15 +605,14 @@ static BOOL FUKillSwitchEngaged(void) {
 
             VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb qualityGate:YES];
             if (!face) return;
+            FUStatusAdd(@"faces", 1);
 
             VNFeaturePrintObservation *print =
                 [FacePrint observationForFace:face pixelBuffer:pb logPrefix:@"tweak"];
             if (!print) return;
 
             NSArray *snapshot = nil;
-            @synchronized (_templatesLock) {
-                snapshot = [_templates copy];   // copy under the lock: the array
-            }                                    // is mutated on this same queue
+            @synchronized (_tplLock) { snapshot = _templates; }
             if (snapshot.count == 0) return;
 
             float best = INFINITY;
@@ -401,161 +620,197 @@ static BOOL FUKillSwitchEngaged(void) {
                 float d = [FacePrint distanceFromTemplate:rec toPrint:print];
                 if (d < best) best = d;
             }
-            if (best == INFINITY) return;
-            if (best < _sessionBest) _sessionBest = best;
-            [self throttledLog:[NSString stringWithFormat:@"distance=%.3f threshold=%.3f", best, self.threshold]];
+            if (!isfinite(best)) return;
+            if (best < _best) _best = best;
+            FUStatusSet(@"lastDistance", @(best));
+
+            NSTimeInterval t = [NSDate timeIntervalSinceReferenceDate];
+            if (t - _lastLog > 1.5) {
+                _lastLog = t;
+                FU_LOG("distance=%.3f (threshold=%.2f)", best, self.threshold);
+            }
 
             if (best < self.threshold) {
                 _consecutive++;
-                if (_consecutive >= kRequiredConsecutive) {
+                if (_consecutive >= kRequiredMatches) {
                     _consecutive = 0;
-                    [self requestFaceUnlock:best];
+                    [self requestUnlock:best];
                 }
             } else {
                 _consecutive = 0;
             }
-        } @catch (NSException *ex) {
-            FU_LOG("capture exception: %@", ex.reason);
+        } @catch (NSException *e) {
+            FU_LOG("frame exception: %@", e.reason);
             [self stopScanning];
         }
     }
 }
 
-- (void)throttledLog:(NSString *)msg {
-    NSTimeInterval t = [NSDate timeIntervalSinceReferenceDate];
-    if (t - _lastLog < kLogInterval) return;
-    _lastLog = t;
-    FU_LOG("%@", msg);
-}
-
 #pragma mark - unlock
-- (void)requestFaceUnlock:(float)distance {
-    if (self.faceUnlockInProgress) return;
-    self.faceUnlockInProgress = YES;
+- (void)requestUnlock:(float)distance {
+    if (_unlocking) return;
+    _unlocking = YES;
+    FU_LOG("MATCH (distance=%.3f) - unlocking", distance);
+    FUStatusSet(@"lastMatch", @(distance));
+    FUStatusAdd(@"matches", 1);
     [self stopScanning];
-    FU_LOG("MATCH distance=%.3f - requesting unlock", distance);
     dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            id vc = self.dashBoardVC;
-            if (vc && [vc respondsToSelector:@selector(setAuthenticated:)]) {
-                ((void (*)(id, SEL, BOOL))objc_msgSend)(vc, @selector(setAuthenticated:), YES);
-            } else {
-                FU_LOG("setAuthenticated: unavailable - using unlock-request fallback");
-                [self completeFaceUnlock];
-            }
-            // safety net: if the hook never completes the unlock, force it shortly after
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @autoreleasepool {
-                    if (self.faceUnlockInProgress) {
-                        FU_LOG("safety net: forcing unlock request");
-                        [self completeFaceUnlock];
-                    }
-                }
-            });
-        }
+        @autoreleasepool { [self performUnlockChain]; }
     });
 }
 
-// Mirrors FastUnlockX (CP Digital Darkroom, MIT): after authentication the lock
-// screen asks SBLockScreenManager to complete the unlock. Their tweak guards the
-// call with !hasContent on the combined list; we do the same via KVC.
-- (void)completeFaceUnlock {
-    self.faceUnlockInProgress = NO;
-    id lockMgr = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
-    SEL sel = @selector(lockScreenViewControllerRequestsUnlock);
-    if (!lockMgr || ![lockMgr respondsToSelector:sel]) {
-        FU_LOG("SBLockScreenManager / lockScreenViewControllerRequestsUnlock unavailable");
-        return;
-    }
-    BOOL hasContent = NO;
+// Try every known unlock route in order and record which one was used, so the
+// next iteration is driven by evidence instead of guesses.
+- (void)performUnlockChain {
     @try {
-        id vc   = self.dashBoardVC;
-        id page = [vc valueForKey:@"mainPageContentViewController"];
-        id list = [page valueForKey:@"combinedListViewController"];
-        NSNumber *hc = [list valueForKey:@"hasContent"];
-        hasContent = [hc isKindOfClass:[NSNumber class]] ? hc.boolValue : NO;
-    } @catch (NSException *ex) {
-        FU_LOG("hasContent probe failed: %@", ex.reason);
-    }
-    if (hasContent) {
-        FU_LOG("unlock request deferred: lock screen has notification content");
-        return;
-    }
-    ((void (*)(id, SEL))objc_msgSend)(lockMgr, sel);
-    FU_LOG("lockScreenViewControllerRequestsUnlock sent");
-}
+        NSMutableArray *log = [NSMutableArray array];
+        id mgr = [FUClass(@"SBLockScreenManager") sharedInstance];
+        if (!mgr) {
+            FU_LOG("SBLockScreenManager unavailable");
+            FUStatusSet(@"unlockPath", @"no SBLockScreenManager");
+            _unlocking = NO;
+            return;
+        }
 
-#pragma mark - state transitions
-- (void)lockScreenDidAppear {
-    self.deviceLocked = YES;
-    if (FUKillSwitchEngaged()) return;
-    if (!self.enabled) return;
-    if (!_setUpDone) [self setUp];
-    [self startScanning];
-}
+        // candidate lock-screen view controllers
+        NSMutableArray *cands = [NSMutableArray array];
+        if (self.lockScreenVC) [cands addObject:self.lockScreenVC];
+        for (NSString *key in @[@"lockScreenViewController", @"_lockScreenViewController"]) {
+            @try {
+                id v = [mgr valueForKey:key];
+                if (v && ![cands containsObject:v]) [cands addObject:v];
+            } @catch (NSException *e) {}
+        }
+        // NB: deliberately no UIApplication.windows here. It is deprecated in the
+        // iOS 15 SDK and theos builds with -Werror; KVC on SBLockScreenManager plus
+        // the hooked controller already give us every candidate we need.
 
-- (void)noteDeviceLocked {
-    self.deviceLocked = YES;
-    if (FUKillSwitchEngaged()) return;
-    if (!self.enabled) return;
-    if (!_setUpDone) [self setUp];
-    [self startScanning];
+        // route 1: setAuthenticated:YES on whatever implements it
+        for (id c in cands) {
+            if (![c respondsToSelector:NSSelectorFromString(@"setAuthenticated:")]) continue;
+            @try {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(c, NSSelectorFromString(@"setAuthenticated:"), YES);
+                [log addObject:[NSString stringWithFormat:@"setAuthenticated on %@", NSStringFromClass([c class])]];
+                break;
+            } @catch (NSException *e) {
+                [log addObject:[NSString stringWithFormat:@"setAuthenticated threw on %@",
+                                NSStringFromClass([c class])]];
+            }
+        }
+
+        // route 2: unlockUIFromSource:withOptions: (iOS 13+)
+        SEL s2 = NSSelectorFromString(@"unlockUIFromSource:withOptions:");
+        if ([mgr respondsToSelector:s2]) {
+            @try {
+                ((void (*)(id, SEL, long, id))objc_msgSend)(mgr, s2, 0L, nil);
+                [log addObject:@"unlockUIFromSource"];
+            } @catch (NSException *e) {
+                [log addObject:@"unlockUIFromSource threw"];
+            }
+        }
+
+        // route 3: the call FastUnlockX uses to complete the unlock
+        SEL s3 = NSSelectorFromString(@"lockScreenViewControllerRequestsUnlock");
+        if ([mgr respondsToSelector:s3]) {
+            @try {
+                ((void (*)(id, SEL))objc_msgSend)(mgr, s3);
+                [log addObject:@"requestsUnlock"];
+            } @catch (NSException *e) {
+                [log addObject:@"requestsUnlock threw"];
+            }
+        }
+
+        NSString *path = log.count ? [log componentsJoinedByString:@" + "] : @"no route available";
+        FU_LOG("unlock routes: %@", path);
+        FUStatusSet(@"unlockPath", path);
+
+        // did it actually work?
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                BOOL stillLocked = NO;
+                @try {
+                    id m = [FUClass(@"SBLockScreenManager") sharedInstance];
+                    if ([m respondsToSelector:NSSelectorFromString(@"isLockScreenVisible")]) {
+                        stillLocked = ((BOOL (*)(id, SEL))objc_msgSend)(
+                            m, NSSelectorFromString(@"isLockScreenVisible"));
+                    }
+                } @catch (NSException *e) {}
+                FUStatusSet(@"stillLockedAfterUnlock", @(stillLocked));
+                FU_LOG("post-unlock check: stillLocked=%d", stillLocked);
+                FUStatusFlush(YES);
+                self->_unlocking = NO;
+            }
+        });
+    } @catch (NSException *e) {
+        FU_LOG("unlock chain exception: %@", e.reason);
+        _unlocking = NO;
+    }
 }
 
 @end
 
 // ---------------------------------------------------------------------------
-// hooks
+// hooks (the only SpringBoard interaction; each body is fully contained)
 // ---------------------------------------------------------------------------
-static inline FaceUnlockManager *FUMgr(void) { return [FaceUnlockManager sharedManager]; }
-
-%hook SBDashBoardViewController
-
+%group FUCoverSheet
+%hook CSCoverSheetViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     @autoreleasepool {
-        @try {
-            if (FUKillSwitchEngaged()) return;
-            FUMgr().dashBoardVC = self;
-            [FUMgr() lockScreenDidAppear];
-        } @catch (NSException *ex) {
-            FU_LOG("viewDidAppear hook exception: %@", ex.reason);
-        }
+        @try { [[FaceUnlockManager shared] noteLockScreenAppeared:self]; }
+        @catch (NSException *e) { FU_LOG("coverSheet hook: %@", e.reason); }
     }
 }
-
-- (void)setAuthenticated:(BOOL)authenticated {
-    BOOL ours = NO;
-    @autoreleasepool {
-        @try {
-            ours = FUMgr().faceUnlockInProgress;
-            %orig;
-            if (authenticated) {
-                if (ours) [FUMgr() completeFaceUnlock];   // finish the unlock we requested
-            } else {
-                [FUMgr() noteDeviceLocked];
-            }
-        } @catch (NSException *ex) {
-            FU_LOG("setAuthenticated hook exception: %@", ex.reason);
-        }
-    }
-}
-
+%end
 %end
 
-// Load-time rule: NOTHING but a single log line may run here. Tweaks are
-// injected at dyld time, before SpringBoard is initialized — even
-// +sharedInstance on a SpringBoard singleton crashes the process (Safe Mode),
-// and notify_register_dispatch is deferred to setUp() for the same reason.
-%ctor {
-    // Substrate already restricts this dylib to SpringBoard via FaceUnlock.plist.
-    // This is defense in depth: if that filter is ever lost, the tweak must stay
-    // inert in every other process instead of running its constructor there.
-    NSString *host = [[NSBundle mainBundle] bundleIdentifier];
-    if (![host isEqualToString:@"com.apple.springboard"]) {
-        FU_LOG("ctor: host %@ is not SpringBoard - staying inert", host);
-        return;
+%group FUDashBoard
+%hook SBDashBoardViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    @autoreleasepool {
+        @try { [[FaceUnlockManager shared] noteLockScreenAppeared:self]; }
+        @catch (NSException *e) { FU_LOG("dashBoard hook: %@", e.reason); }
     }
-    FU_LOG("ctor: FaceUnlock loaded (dyld time, no SpringBoard API touched)");
+}
+%end
+%end
+
+%ctor {
+    @autoreleasepool {
+        // Nothing here may touch SpringBoard: this runs at dyld time, before the
+        // host process is initialized.
+        NSString *host = [[NSBundle mainBundle] bundleIdentifier];
+        if (![host isEqualToString:@"com.apple.springboard"]) {
+            NSLog(@"[FaceUnlock] ctor: host %@ is not SpringBoard - inert", host);
+            return;
+        }
+        if (FUBootGuard()) {
+            NSLog(@"[FaceUnlock] ctor: crash loop detected - tweak disabled, hooking nothing");
+            // leave a trace the app can show even though the manager never starts
+            @try {
+                [@{ @"version": @"2.0.0",
+                    @"state": @"disabled: crash loop detected at load (SpringBoard was restarting)",
+                    @"updated": [NSDate date],
+                    @"updatedEpoch": @([NSDate timeIntervalSinceReferenceDate]),
+                    @"killSwitch": @YES,
+                    @"hostUp": @NO }
+                 writeToFile:FUPath(@"status.plist") atomically:YES];
+            } @catch (NSException *e) {}
+            return;
+        }
+        // hook only after the guard, so a crash-looping boot installs no hooks
+        %init(FUCoverSheet);
+        %init(FUDashBoard);
+        NSLog(@"[FaceUnlock] ctor: loaded, setup deferred 3s");
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                @try { [[FaceUnlockManager shared] start]; }
+                @catch (NSException *e) { FU_LOG("deferred start: %@", e.reason); }
+            }
+        });
+    }
 }

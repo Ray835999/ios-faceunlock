@@ -1,159 +1,120 @@
-# FaceUnlock — 免费版「Vizage」平替（iPhone 6s / iOS 15 rootless）
+# FaceUnlock 2.0.0 — 摄像头人脸解锁（iPhone 6s / iOS 15 rootless）
 
-用**前置摄像头 + Vision 人脸特征指纹**在越狱的 Touch ID 机型上实现人脸解锁。
-Vizage（foxfortmobile，$3.99）是唯一在维护的同类商业插件；本仓库是免费自建实现，
-针对 **iPhone 6s / iOS 15.8.x / Dopamine rootless palera1n**，arm64 rootless deb。
+用**前置摄像头 + Vision 人脸特征指纹**在越狱的 Touch ID 机型上实现人脸解锁，
+是 Vizage（foxfortmobile，$3.99）的免费自建平替。
+目标环境：**iPhone 6s / iOS 15.8.x / Dopamine rootless**，arm64 rootless deb。
 
 一个包两件东西：
 
 | 组件 | 作用 |
 |---|---|
-| **FaceUnlockSettings.app** | 设置 App：录入人脸、开关、阈值、清除 |
+| **FaceUnlockSettings.app** | 设置 App：录入人脸、开关、急停、屏内诊断 |
 | **FaceUnlock.dylib**（SpringBoard 插件） | 锁屏匹配 + 解锁，无 UI |
 
-录入和匹配跑的是**同一份 `FacePrint.m` 代码**，两边特征指纹可直接比对。
+录入和匹配跑的是**同一份 `FacePrint.m`**，两边特征指纹可直接比对。
 
-## 原理
+---
 
-1. 在 **FaceUnlockSettings App** 里录入：App 自己跑前置摄像头 + Vision
-   （`VNDetectFaceRectanglesRequest` + 质量门 + `VNGenerateFaceFeaturePrintRequest`），
-   采 5 个样本写入 `/var/jb/var/mobile/Library/FaceUnlock/templates.plist`，
-   然后发 Darwin 通知 `com.ray835999.faceunlock.templates-changed`。
-2. 插件收到通知立即热重载模板；锁屏出现时启动摄像头匹配（约 3fps，12 秒窗口）。
-3. **匹配**：阈值内连续 2 帧匹配 → `setAuthenticated:YES` →
-   `SBLockScreenManager lockScreenViewControllerRequestsUnlock`
-   （与开源插件 FastUnlockX 相同的解锁完成调用；锁屏有通知横幅时会先跳过，
-   与 FastUnlockX 的 `hasContent` 保护一致）。
-4. **匹配器**：优先私有类 `VNGenerateFaceFeaturePrintRequest`（Photos 同款人脸嵌入，
-   运行时探测）；不可用时自动回退「裁剪人脸 → 归一化 256px → `VNGenerateImageFeaturePrintRequest`」。
+## 2.0.0 是一次重写，不是修补
 
-> 安全说明：2D 摄像头比对可以用照片/视频欺骗（Vizage 也一样，官方自己承认），
-> 不支持 Apple Pay；请不要把它当唯一防护。
+v1.x 反复出现「一会儿崩溃、一会儿点不了」。根因不是某一行代码写错，而是**架构把太多
+东西塞进了 SpringBoard 进程**：`%ctor` 里注册通知、hook 锁屏控制器生命周期、`dlopen`
+框架、在 springboard 里起摄像头会话。任何一处抛异常或阻塞，用户看到的就是 Safe Mode
+或「整台手机点不动」（SpringBoard 卡死 = 所有按钮都失效）。
 
-## 安装
+2.0.0 换了个前提：**假设这个进程随时会被自己搞死**。
 
-1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_1.2.2-1+debug_iphoneos-arm64.deb`。
-2. 传到手机（Filza/SSH），Sileo/Zebra 安装或 `dpkg -i`（rootless 环境自动装到 `/var/jb`）。
-   安装脚本会自动跑 `uicache`，桌面出现 **FaceUnlock** 图标
-   （若图标没出现，手动执行 `uicache` 或 `ldrestart`）。
-3. **必须先设锁屏密码**（和 Vizage 一样的要求）。
-4. v1.2.2 起首次打开 App 会**自动弹一个「启动诊断」框**（不需要点任何按钮）——
-   这是给「App 能打开但按钮点不动」类问题做的被动取证。看完点
-   **「关闭诊断」** 即永久关闭；完整日志在
-   `/var/jb/var/mobile/Library/FaceUnlock/ui-diagnostic.log`。
+| 机制 | 解决的症状 |
+|---|---|
+| **崩溃循环熔断**：`%ctor` 记开机计数，120 秒内被加载 4 次 → 自动写 `DISABLED` 并**不安装任何 hook** | 崩一次就自愈，不会被拖进 Safe Mode 死循环 |
+| **零框架符号**：AVFoundation/CoreVideo 常量全部换字面量（`"vide"`、`"PixelFormatType"`、`0x42475241`），dylib 里**没有任何框架加载命令** | 加载期不可能因框架缺失而崩 |
+| **什么都不在加载期做**：`%ctor` 不碰 SpringBoard、不注册通知、不 dlopen；3 秒后才 setup，框架首次真正需要时才加载 | 消除 dyld 期崩溃 |
+| **无帧看门狗**：起会话后 3 秒没收到帧 → 在自己队列上拆掉会话并计数，累计 3 次自动禁用 | 不会把摄像头攥在手里卡死手机 |
+| **解锁多路链**：`setAuthenticated:` → `unlockUIFromSource:withOptions:` → `lockScreenViewControllerRequestsUnlock`，逐条尝试并记录哪条生效 | 不用猜 iOS 15 的私有 API，哪条通用哪条 |
+| **遥测代替抓日志**：所有状态写进 `status.plist`，App 首页直接显示 | 不用连电脑、不用敲命令行 |
+| **急停开关**：App 里一个红色按钮，或手工 `touch .../DISABLED` | 任何异常都能一秒自救 |
 
-## 使用（empirical 验证流程）
+App 侧同样重写：**丢掉 `UITableViewController` + `UINavigationController`**，改成单个
+`UIViewController` + 手摆 frame 的 `UIButton`，并且**屏上带触摸计数器 + hitTest 命中视图**，
+让「触摸没进进程」和「控件被盖住」当场可区分。
 
-1. 打开桌面的 **FaceUnlock** App →「开始录入人脸」→ 允许相机权限 →
-   正脸对摄像头、缓慢转头，采满 5 个样本（进度 5/5 自动保存）。
-   日志：`log stream --predicate 'process == "SpringBoard"' | grep FaceUnlock`
-   （App 的日志在同一条流里，前缀都是 `[FaceUnlock]`）
-2. 锁屏，正脸看前置摄像头，日志出现
-   `[FaceUnlock] MATCH distance=0.xxx - requesting unlock` 即解锁。
-3. 录入完成后插件日志会打印 `templates reloaded: 5`，确认通信链路通了。
+---
 
-调校参数（App 里也能改，写的是同一份 plist：
-`/var/jb/var/mobile/Library/Preferences/com.ray835999.faceunlock.plist`）：
+## 使用方法
 
-| Key | 类型 | 默认 | 说明 |
-|---|---|---|---|
-| `Enabled` | Bool | `true` | 总开关 |
-| `Threshold` | Number | `0.5` | 匹配距离阈值。不识别就调大（0.6~0.8），误解锁就调小 |
+1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_2.0.0-1+debug_iphoneos-arm64.deb`。
+2. 传到手机（Filza / SSH），Sileo / Zebra 安装或 `dpkg -i`（rootless 自动装到 `/var/jb`）。
+   安装脚本会自动 `uicache`，桌面出现 **FaceUnlock** 图标。
+3. **先设好锁屏密码**（和 Vizage 一样的前提）。
+4. **重装后必须注销/重启一次**，否则插件不会重新注入 SpringBoard。
+5. 打开 **FaceUnlock** → 点 **① 开始录入人脸** → 把脸放进圆圈，自动采集 5 个样本。
+6. 锁屏，把脸对准前置摄像头。
 
-- 想录第二个人的脸：App 里先「清除」，再让对方录 5 次即可。
-- 每次扫描会话结束会打印 `scan session best distance=...`，这是调 Threshold 的依据。
+> App 首页顶部那张状态卡就是诊断面板：`当前状态` / `SB相机权限` / `会话/帧/脸` /
+> `最近距离` / `解锁路径` / `解锁结果`。没反应时先看它，再点「复制诊断信息」发出来。
 
-## 如果 App 能打开但按钮点不动（v1.2.2 被动诊断 SOP）
+---
 
-v1.2.2 起 App 启动 1.5 秒后会**自动**把 UI 状态写进
-`/var/jb/var/mobile/Library/FaceUnlock/ui-diagnostic.log`（并弹一次框展示），
-不需要用户点任何按钮。日志格式固定，三种根因可直接区分：
+## 排障对照表
 
-| 日志特征 | 根因 | 处理 |
-|---|---|---|
-| 没有 `event: touches` 行，且 `snapshot` 里 `key=0` | 窗口可见但**不是 key window**（收不到任何触摸） | v1.2.2 已在 `applicationDidBecomeActive` 自动重抢 key；若仍复现，把 `snapshot` 行发来 |
-| `didFinishLaunching: begin` 之后日志戛然而止 | 主线程在启动阶段卡死 | 看最后一条面包屑停在哪，把日志发来 |
-| 有 `event: touches` 行但点击无反应 | 事件到了窗口、视图树不该拦的 | 看 `hits=` 三点 hitTest 结果 + 是否有 `force-enabling` 行（v1.2.2 会自动放开并记录） |
+| 状态卡显示 | 含义 / 处理 |
+|---|---|
+| `插件遥测：无（尚未在 SpringBoard 中运行）` | 插件没注入。注销或重启一次 |
+| `当前状态：disabled (kill switch)` | 被急停/自动禁用了。打开开关或点「重新启用」 |
+| `当前状态：disabled: crash loop detected` | 上次真的崩过，已自动熔断保护。看「最近错误」判断原因 |
+| `SB相机权限：被拒绝` | SpringBoard 没有相机权限 —— 这是插件起摄像头失败最常见原因 |
+| `当前状态：no frames (camera not delivering)` | 会话起了但拿不到帧，8 成是权限；3 次后会自动禁用 |
+| `当前状态：no templates` | 还没录入，或录入没保存成功 |
+| `会话/帧/脸：2 / 0 / 0` | 会话起了，帧没到 → 权限问题 |
+| `会话/帧/脸：2 / 300 / 0` | 有画面但没检测到脸 → 光线/距离/前置摄像头被挡 |
+| `最近距离：0.62`（阈值 0.55） | 认出来了但不够像。多录几个角度，或调阈值 |
+| `解锁路径：no route available` | 私有 API 全不响应（系统版本差异），把这行发出来 |
+| `解锁结果：仍锁屏(失败)` | 认证设置了但没完成解锁，需要换一条路由 |
 
-- `snapshot` 行里的 `events=` 是启动至今窗口收到的触摸事件总数——用户点过还是 0，
-  就 100% 是「窗口失键/应用未激活」，与 App 代码无关。
-- 录入界面相机任何失败都会**显示具体原因 + 「重试打开相机」按钮**，不会再黑屏干等。
-- 急停：建文件 `/var/jb/var/mobile/Library/FaceUnlock/DISABLED` 可完全停用插件（不影响 App）。
+按钮点了没反应时，看首页底部 **「触摸事件」**：
 
-## 如果进 Safe Mode / SpringBoard 崩溃（v1.2.0 排查 SOP）
-按日志三阶段定位（**按顺序看，能直接指出崩在哪一层**）：
+* 数字**不动** → 触摸根本没进 App 进程（窗口/事件层问题）
+* 数字**会动**，但点按钮没反应 → 看「命中视图」，说明按钮被别的东西盖住了
+
+---
+
+## 急停 / 恢复
 
 ```bash
-log stream --predicate 'process == "SpringBoard"' | grep FaceUnlock
+# 立即禁用（不改任何代码，重启也保持禁用）
+touch /var/jb/var/mobile/Library/FaceUnlock/DISABLED
+
+# 恢复
+rm /var/jb/var/mobile/Library/FaceUnlock/DISABLED
+rm /var/jb/var/mobile/Library/FaceUnlock/boot.plist
 ```
 
-| 日志停在哪 | 含义 | 处理 |
-|---|---|---|
-| **完全没有 `ctor:`** | dyld 加载期就死了（框架链接/链接器层面） | v1.2.1 起 Vision/AVFoundation/CoreMedia/CoreVideo 已改为**弱链接且不带任何加载命令**，加载期不可能再因框架而死；若仍出现，请把手机「设置 → 隐私 → 分析与改进 → 分析数据 → `SpringBoard-*.ips`」里最新一条崩溃报告发来 |
-| 有 `ctor:` 没有 `loaded:` | 首次锁屏 `setUp` 阶段崩 | 看 `dlopen CoreMedia/AVFoundation/Vision` 三行是否打印完——崩在哪个后面就是哪个框架的初始化问题 |
-| 有 `loaded:` 没有 `scanning started` | 摄像头会话启动阶段崩 | 日志里会先打印 `camera authorization status:`，把它一起发来 |
-| 有 `scanning started` 后崩 | 帧处理/解锁链路崩 | 看最后一条日志 |
+App 里的红色按钮「② 急停」做的是一样的事，不需要终端。
 
-1. **不进 Safe Mode 的软关闭**：写 `{"Enabled": false}` 到 prefs plist 后 `ldrestart`；
-   或建急停文件 `/var/jb/var/mobile/Library/FaceUnlock/DISABLED`（存在即完全停用，
-   连 hook 内部逻辑都不跑）。
-2. **卸载**：Safe Mode 里能开 Sileo/Zebra，直接移除 FaceUnlock；或 SSH 进手机
-   `dpkg -r com.ray835999.faceunlock && ldrestart`。
-3. **隔离 App 侧**（判断是不是 App 引起的）：
-   `rm -rf /var/jb/Applications/FaceUnlockSettings.app && uicache && ldrestart`
-   —— 不崩就说明是 App 侧问题；崩则是插件侧。
+## 数据文件
 
-v1.2.0 崩溃加固（v1.0.x 两次 Safe Mode 的根因都已覆盖）：
+全部在 `/var/jb/var/mobile/Library/FaceUnlock/`：
 
-- **`%ctor` 只打一行日志**，不注册通知、不碰任何 API（v1.0.0 的根因是
-  `%ctor` 里调 `SBLockScreenManager sharedInstance`；v1.2.x 起
-  `notify_register_dispatch` 也挪到了 `setUp`）。
-- **Vision / AVFoundation / CoreMedia / CoreVideo 弱链接且不带加载命令**：
-  编译产物里这些框架**没有任何 LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB**——
-  dyld 在把插件注入 SpringBoard 时不会去加载它们，加载期零风险；
-  运行时在 `setUp` 里 `dlopen`，失败只打日志并禁用功能。
-- 所有类引用走 `NSClassFromString`、所有 extern 常量做 NULL 检查
-  （`AVMediaTypeVideo`、`AVCaptureSessionPreset640x480`、
-  `kCVPixelBufferPixelFormatTypeKey` 等弱引用符号）。
-- 所有 hook body 与采集管线包 `@try/@catch`。
-- 回退匹配器不用 UIKit 后台绘图，纯 CoreImage。
-- `AVCaptureSession` 生命周期归采集队列，主线程只翻 BOOL 闸门 + 会话代际。
-- 模板数组跨线程访问全部加锁；不写 `NSNull` 进 plist。
-- 解锁调用前带 FastUnlockX 同款 `hasContent` 保护。
-- 安装后 `postinst` 自动 `uicache`；`layout/DEBIAN/postinst` 以 755 模式提交
-  （Contents API 不记录 mode，是用 Git Data API 补的 tree entry mode）。
+| 文件 | 内容 |
+|---|---|
+| `templates.plist` | 录入的人脸特征指纹 |
+| `status.plist` | 插件遥测（App 首页显示的就是它） |
+| `tweak.log` | 插件日志（上限 96 KB 自动截断） |
+| `app.log` | App 日志 |
+| `DISABLED` | 急停开关 |
+| `boot.plist` | 崩溃循环熔断计数 |
 
-## 已知限制
+---
 
-- 解锁的是锁屏 UI 层；SEP/钥匙串状态不变（与 Appellancy/Vizage 同类 2D 方案相同性质）。
-- 暗光下前置摄像头画质差，识别率下降；质量分低的帧会被丢弃。
-- 扫描窗口 12 秒无匹配自动停（省电），下次亮屏重新开始。
-- 插件在 SpringBoard 进程里跑摄像头，若日志显示
-  `camera authorization status: 0`（notDetermined）且始终拿不到帧，
-  说明该进程没有相机 TCC 授权——那是体系限制，需要改成「App 侧匹配 +
-  通知驱动解锁」架构（v1.3.0 候选方案）。
+## 技术要点
 
-## 构建
-
-GitHub Actions（ubuntu + theos + iPhoneOS15.6.sdk + L1ghtmann toolchain）：
-push 到 main 或手动 dispatch 即出 rootless deb（含 tweak + App）。本地构建：
-
-```bash
-export THEOS=~/theos
-make package THEOS_PACKAGE_SCHEME=rootless
-```
-
-工程结构：
-
-```
-Tweak.xm                      # SpringBoard 插件：匹配 + 解锁（框架弱链接 + 运行时 dlopen）
-FacePrint.h/.m                # 共享管线：检测 / 特征指纹 / 模板读写 / 距离
-settings/main.m               # App 入口
-settings/FaceUnlockSettings.m # App UI：菜单 + 录入界面
-settings/FaceUnlockSettings.h # App 类声明
-settings/Info.plist           # 相机权限 / 图标（after-stage 覆盖 theos 自动生成的）
-settings/AppIcon60x60@2x.png  # 120x120 图标
-layout/DEBIAN/postinst        # 安装后 uicache，让桌面出现 App 图标
-Makefile                      # tweak（WEAK_FRAMEWORKS）+ application 两个 target
-control                       # deb 元数据
-```
+* **Vision**：`VNDetectFaceRectanglesRequest` + `VNDetectFaceCaptureQualityRequest` 质量门，
+  特征指纹优先私有 `VNGenerateFaceFeaturePrintRequest`，回退到「裁剪人脸 → 归一化 256px →
+  `VNGenerateImageFeaturePrintRequest`」。距离用 `computeDistance:toFeaturePrintObservation:`
+  优先，回退原始向量欧氏距离。
+* **解锁**：先设 `setAuthenticated:YES`，再走 `SBLockScreenManager` 的三条解锁路由，
+  1.2 秒后回查 `isLockScreenVisible` 自检是否真的解开。
+* **触发**：Darwin 通知 `com.apple.springboard.lockcomplete`（主）+ `CSCoverSheetViewController`
+  / `SBDashBoardViewController` 的 `viewDidAppear:`（备），两者都不存在也不影响加载。
+* **构建**：theos + iPhoneOS 15.6 SDK + L1ghtmann 工具链，GitHub Actions 出 deb；
+  `layout/DEBIAN/postinst` 必须是 0755（theos 会拒绝 644）。
