@@ -549,5 +549,13 @@ static inline FaceUnlockManager *FUMgr(void) { return [FaceUnlockManager sharedM
 // +sharedInstance on a SpringBoard singleton crashes the process (Safe Mode),
 // and notify_register_dispatch is deferred to setUp() for the same reason.
 %ctor {
+    // Substrate already restricts this dylib to SpringBoard via FaceUnlock.plist.
+    // This is defense in depth: if that filter is ever lost, the tweak must stay
+    // inert in every other process instead of running its constructor there.
+    NSString *host = [[NSBundle mainBundle] bundleIdentifier];
+    if (![host isEqualToString:@"com.apple.springboard"]) {
+        FU_LOG("ctor: host %@ is not SpringBoard - staying inert", host);
+        return;
+    }
     FU_LOG("ctor: FaceUnlock loaded (dyld time, no SpringBoard API touched)");
 }
