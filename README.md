@@ -1,4 +1,4 @@
-# FaceUnlock 2.6.0 — 摄像头人脸解锁（iPhone 6s / iOS 15 rootless）
+# FaceUnlock 2.7.0 — 摄像头人脸解锁（iPhone 6s / iOS 15 rootless）
 
 用**前置摄像头 + Vision 人脸特征指纹**在越狱的 Touch ID 机型上实现人脸解锁，
 是 Vizage（foxfortmobile，$3.99）的免费自建平替。
@@ -12,6 +12,37 @@
 | **FaceUnlock.dylib**（SpringBoard 插件） | 锁屏匹配 + 解锁，无 UI |
 
 录入和匹配跑的是**同一份 `FacePrint.m`**，两边特征指纹可直接比对。
+
+---
+
+## 2.7.0 修的是什么（"上传照片说加载失败"）
+
+相册界面能打开、照片也能勾选，但一到"加载"就失败。这说明 `PHPickerViewController`
+本身没问题，**失败的是它把图片字节交给我们的那一步**：`-loadObjectOfClass:` 走的
+是 picker 扩展 → App 的 XPC 通道，Dopamine 的假签名 App 上这条通道会被直接拒掉，
+provider 连字节都不给。
+
+这一版把加载换成**同时开四条通道，哪条先到用哪条**，并且**失败的每一档都写清原因**：
+
+| 通道 | API | 说明 |
+|---|---|---|
+| 1 | `loadDataRepresentationForTypeIdentifier:`（首选类型） | 拿原始字节自己解码，最直接 |
+| 2 | 同上，但遍历 provider 声明的其余类型 | HEIC/JPEG/PNG 逐个试 |
+| 3 | `loadObjectOfClass:[UIImage class]` | 原来的路子，留着当一条 |
+| 4 | `loadFileRepresentationForTypeIdentifier:` → `NSData` | 要一份文件拷贝自己读 |
+
+失败不再是"有一张读不出来"，而是 `public.heic 无数据(NSCocoaErrorDomain/4097)`
+这种能直接定位的字符串。单个 provider 15 秒没字节会自己放弃并说明（iCloud 没下载的照片
+就是这个症状）。
+
+**更重要的是新增一条完全不问任何系统服务的路** —— 直接读文件：
+
+| 入口 | 说明 |
+|---|---|
+| **「② 从「文件」选照片」** | `UIDocumentPickerViewController`，把图片**拷贝成我们目录里的真实文件**再读，不走 photo 服务、不走 item provider |
+| **App 的 Documents 目录** | 已开 `UIFileSharingEnabled`：用电脑（iTunes / iMazing / 爱思）、Filza 或 scp 把 jpg 丢进 `.../Documents/`，**进录入页就自动导入**，一张按钮都不用点。导入成功的文件会移到 `Documents/imported/`，不会重复加样本 |
+
+本地读文件这条路是确定能通的——它不需要相机、不需要 TCC、不需要 XPC。
 
 ---
 
@@ -268,18 +299,27 @@ Vision 640x480 丢0 方向right · rect: 1 face(s)
 
 ## 使用方法
 
-1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_2.6.0-1+debug_iphoneos-arm64.deb`。
+1. 从 GitHub Actions artifact 下载 `com.ray835999.faceunlock_2.7.0-1+debug_iphoneos-arm64.deb`。
 2. 传到手机（Filza / SSH），Sileo / Zebra 安装或 `dpkg -i`（rootless 自动装到 `/var/jb`）。
    安装脚本会自动 `uicache`，桌面出现 **FaceUnlock** 图标。
 3. **先设好锁屏密码**（和 Vizage 一样的前提）。
 4. **重装后必须注销/重启一次**，否则插件不会重新注入 SpringBoard。
-5. 打开 **FaceUnlock** → 点 **① 开始录入人脸** → 点蓝色 **「① 从相册选照片（推荐）」**。
-   - 在相册里勾 1~5 张**正面自拍**（光线亮、别侧头），选完自动识别；
-   - 每张都会回报「成功 / 没检测到人脸 / 太暗太糊」；
-   - 有样本之后右边出现 **「保存 N 张」**，点它直接完成 —— **1 张也够**；
-   - 相册里没有合适的自拍：先用别的 App 拍几张存进相册，或在录入页点右上角
-     **「② 相机」** 用 App 内快门现拍（部分机器上这条路拿不到画面，属正常）。
-6. 锁屏，把脸对准前置摄像头。
+5. 打开 **FaceUnlock** → 点 **① 开始录入人脸** → 三个入口，从最靠得住的那个开始：
+   - **「① 从相册选照片（推荐）」**：勾 1~5 张正面自拍。加载失败会写明是哪一档、
+     什么错误码（`public.heic 无数据(NSCocoaErrorDomain/4097)` 这种），不再只说"读不出来"。
+   - **「② 从「文件」选照片」**：相册那条不通就走这条。先把照片在「照片」里
+     → 分享 → **存储到「文件」**，再在这里选。它把图片拷成真实文件再读，不问 photo 服务。
+   - **「③ 相机」**：App 内快门，只在这台机器静态拍照还能用的前提下有意义。
+   - 有样本之后右边出现 **「保存 N 张」**，点它直接完成 —— **1 张也够**。
+6. 三条路都不通时的**最终保险**：把照片直接放进 App 的目录。
+   ```bash
+   # SSH / Filza 均可（路径里的 UUID 用 ls 找）
+   scp selfie.jpg root@<iphone>:/var/mobile/Containers/Data/Application/<UUID>/Documents/
+   ```
+   或者电脑上用 iMazing / 爱思助手的「文件共享」（`UIFileSharingEnabled` 已开）。
+   **再打开录入页就会自动导入**，一个按钮都不用点。导入成功的文件会移到
+   `Documents/imported/`，不会重复加样本。
+7. 锁屏，把脸对准前置摄像头。
 
 > App 首页顶部那张状态卡就是诊断面板：`当前状态` / `SB相机权限` / `会话/帧/脸` /
 > `最近距离` / `解锁路径` / `解锁结果`。没反应时先看它，再点「复制诊断信息」发出来。

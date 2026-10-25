@@ -13,9 +13,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.6.0</string>
+	<string>2.7.0</string>
 	<key>CFBundleVersion</key>
-	<string>2.6.0</string>
+	<string>2.7.0</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>iPhoneOS</string>
@@ -48,6 +48,10 @@
 	<string>FaceUnlock 需要使用前置摄像头采集人脸特征，用于锁屏人脸解锁。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>FaceUnlock 需要读取你选中的自拍照片，用来补充人脸录入样本。</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>

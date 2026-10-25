@@ -144,7 +144,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                         color:[UIColor whiteColor]];
     [_scroll addSubview:_titleLabel];
 
-    _versionLabel = [self label:@"v2.6.0 · 相册导入版" size:12 weight:UIFontWeightRegular
+    _versionLabel = [self label:@"v2.7.0 · 文件导入版" size:12 weight:UIFontWeightRegular
                           color:[UIColor colorWithWhite:0.6 alpha:1]];
     [_scroll addSubview:_versionLabel];
 
@@ -582,9 +582,160 @@ static NSDictionary *FUSTemplateFromImage(UIImage *img, NSString **why) {
     return t;
 }
 
+#pragma mark - loading one album item
+
+// Loading a PHPicker item is the fragile half of the album route.  The bytes
+// are handed over by the picker extension over XPC, and on a jailbroken
+// fake-signed app that channel can be refused outright: -loadObjectOfClass:
+// then just answers with an error and the screen says "读不出来" no matter how
+// good the photo is.  (That is exactly the "上传照片说加载失败" report.)
+//
+// So every representation API is fired at once and the first one that lands
+// wins.  Each rung keeps its own reason, which is what the screen prints when
+// they all fail — a bare "读不出来" tells nobody anything.
+typedef void (^FUSImageDone)(UIImage *img, NSString *why);
+
+static NSString *FUSPreferredImageType(NSItemProvider *ip) {
+    for (NSString *t in ip.registeredTypeIdentifiers) {
+        NSString *s = [t lowercaseString];
+        if ([s isEqualToString:@"public.image"] ||
+            [s isEqualToString:@"public.jpeg"] ||
+            [s isEqualToString:@"public.heic"] ||
+            [s isEqualToString:@"public.heif"] ||
+            [s isEqualToString:@"public.png"] ||
+            [s isEqualToString:@"public.tiff"]) {
+            return t;
+        }
+    }
+    return @"public.image";
+}
+
+static UIImage *FUSImageFromData(NSData *d) {
+    if (![d isKindOfClass:[NSData class]] || d.length < 64) return nil;
+    UIImage *img = [UIImage imageWithData:d];
+    if (!img) img = [UIImage imageWithData:d scale:1.0];
+    return img;
+}
+
+static void FUSLoadImageFromProvider(NSItemProvider *ip, FUSImageDone done) {
+    if (!ip) { done(nil, @"没有拿到图片句柄"); return; }
+
+    NSString *primary = FUSPreferredImageType(ip);
+    NSMutableArray *types = [NSMutableArray arrayWithObject:primary];
+    for (NSString *t in ip.registeredTypeIdentifiers) {
+        if (types.count >= 3) break;
+        if (![types containsObject:t]) [types addObject:t];
+    }
+    FUSLog(@"album provider: primary=%@ all=%@", primary, ip.registeredTypeIdentifiers);
+
+    __block BOOL      settled = NO;
+    __block NSString *why     = nil;
+    __block int       outstanding = 0;
+
+    void (^settle)(UIImage *, NSString *) = ^(UIImage *img, NSString *reason) {
+        BOOL fire = NO, giveUp = NO;
+        @synchronized (ip) {
+            if (settled) return;
+            if (img) {
+                settled = YES;
+                fire = YES;
+            } else {
+                if (!why) why = reason;
+                if (--outstanding <= 0) { settled = YES; giveUp = YES; }
+            }
+        }
+        if (fire)   { FUSLog(@"album item loaded via %@", primary); done(img, nil); }
+        if (giveUp) { FUSLog(@"album item unreadable: %@", why); done(nil, why ?: @"读不出来"); }
+    };
+
+    NSMutableArray *jobs = [NSMutableArray array];
+
+    // 1) raw bytes for the type the provider prefers — the normal path
+    [jobs addObject:^{
+        @try {
+            [ip loadDataRepresentationForTypeIdentifier:primary
+                                      completionHandler:^(NSData *d, NSError *e) {
+                UIImage *img = FUSImageFromData(d);
+                if (img) { settle(img, nil); return; }
+                settle(nil, [NSString stringWithFormat:@"%@ 无数据(%@/%ld)",
+                             primary, e.domain ?: @"empty", (long)e.code]);
+            }];
+        } @catch (NSException *x) {
+            settle(nil, [NSString stringWithFormat:@"%@ %@", primary, x.reason]);
+        }
+    }];
+
+    // 2) raw bytes for the other advertised types
+    for (NSUInteger i = 1; i < types.count; i++) {
+        NSString *t = [types objectAtIndex:i];
+        [jobs addObject:^{
+            @try {
+                [ip loadDataRepresentationForTypeIdentifier:t
+                                          completionHandler:^(NSData *d, NSError *e) {
+                    UIImage *img = FUSImageFromData(d);
+                    if (img) { settle(img, nil); return; }
+                    settle(nil, [NSString stringWithFormat:@"%@ 无数据(%@/%ld)",
+                                 t, e.domain ?: @"empty", (long)e.code]);
+                }];
+            } @catch (NSException *x) {
+                settle(nil, [NSString stringWithFormat:@"%@ %@", t, x.reason]);
+            }
+        }];
+    }
+
+    // 3) the decoded object, when the provider offers one
+    [jobs addObject:^{
+        BOOL can = NO;
+        @try { can = [ip canLoadObjectOfClass:[UIImage class]]; } @catch (NSException *x) {}
+        if (!can) { settle(nil, @"provider 不提供 UIImage"); return; }
+        @try {
+            [ip loadObjectOfClass:[UIImage class]
+                completionHandler:^(__kindof id<NSItemProviderReading> obj, NSError *e) {
+                UIImage *img = [obj isKindOfClass:[UIImage class]] ? (UIImage *)obj : nil;
+                if (img) { settle(img, nil); return; }
+                settle(nil, [NSString stringWithFormat:@"UIImage(%@/%ld)",
+                             e.domain ?: @"nil", (long)e.code]);
+            }];
+        } @catch (NSException *x) {
+            settle(nil, [NSString stringWithFormat:@"UIImage %@", x.reason]);
+        }
+    }];
+
+    // 4) a copy of the file, decoded by us
+    [jobs addObject:^{
+        @try {
+            [ip loadFileRepresentationForTypeIdentifier:primary
+                                      completionHandler:^(NSURL *url, NSError *e) {
+                NSData *d = url ? [NSData dataWithContentsOfURL:url] : nil;
+                UIImage *img = FUSImageFromData(d);
+                if (img) { settle(img, nil); return; }
+                settle(nil, [NSString stringWithFormat:@"文件(%@/%ld)",
+                             e.domain ?: (url ? @"decode" : @"no-url"), (long)e.code]);
+            }];
+        } @catch (NSException *x) {
+            settle(nil, [NSString stringWithFormat:@"文件 %@", x.reason]);
+        }
+    }];
+
+    outstanding = (int)jobs.count;
+    for (void (^job)(void) in jobs) job();
+
+    // An iCloud-only photo never hands over bytes; say so instead of hanging.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        BOOL dead = NO;
+        @synchronized (ip) { if (!settled) { settled = YES; dead = YES; } }
+        if (dead) {
+            FUSLog(@"album item: no bytes after 15s");
+            done(nil, @"15 秒没拿到图片数据（这张可能只在 iCloud 里）");
+        }
+    });
+}
+
 @interface FUSEnrollViewController () <UIImagePickerControllerDelegate,
                                        UINavigationControllerDelegate,
-                                       PHPickerViewControllerDelegate>
+                                       PHPickerViewControllerDelegate,
+                                       UIDocumentPickerDelegate>
 @end
 
 #pragma mark - in-app shutter
@@ -1072,6 +1223,7 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     UIButton                 *_cancelButton;
     UIButton                 *_retryButton;
     UIButton                 *_manualButton;
+    UIButton                 *_filesButton;
 
     NSDate                   *_lastCapture;
     NSDate                   *_lastMeter;
@@ -1110,7 +1262,7 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    FUSLog(@"enroll viewDidLoad (v2.6.0 album import)");
+    FUSLog(@"enroll viewDidLoad (v2.7.0 album + files)");
     self.view.backgroundColor = [UIColor blackColor];
     _collected = [NSMutableArray array];
     _queue = dispatch_queue_create("com.ray835999.faceunlock.enroll", DISPATCH_QUEUE_SERIAL);
@@ -1178,10 +1330,23 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
             forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_manualButton];
 
-    // Secondary route: our own camera page, top-right.  Kept because it is the
-    // only path that produces a fresh sample on devices where captures work.
+    // Second route: the Files app.  It hands over a real file instead of an XPC
+    // item provider, so it keeps working when the album channel is refused.
+    _filesButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_filesButton setTitle:@"② 从「文件」选照片" forState:UIControlStateNormal];
+    [_filesButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _filesButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    _filesButton.backgroundColor = [UIColor colorWithRed:0.16 green:0.42 blue:0.62 alpha:1];
+    _filesButton.layer.cornerRadius = 8;
+    _filesButton.exclusiveTouch = YES;
+    [_filesButton addTarget:self action:@selector(filesTapped:)
+           forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_filesButton];
+
+    // Third route: our own camera page.  Kept because it is the only path that
+    // produces a fresh sample on devices where captures do answer.
     _camButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_camButton setTitle:@"② 相机" forState:UIControlStateNormal];
+    [_camButton setTitle:@"③ 相机" forState:UIControlStateNormal];
     [_camButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     _camButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     _camButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
@@ -1202,6 +1367,10 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     [_retryButton addTarget:self action:@selector(retryTapped:)
            forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_retryButton];
+
+    // Nothing to tap at all: if photos were dropped into the app's Documents
+    // folder (iTunes / iMazing / Filza / scp), import them right away.
+    [self autoImportLocalFiles];
 }
 
 - (UILabel *)label:(NSString *)text size:(CGFloat)size weight:(UIFontWeight)weight {
@@ -1227,19 +1396,27 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
 
     CGFloat meterH = 62;
     CGFloat meterY = h - insets.bottom - 8 - meterH;
-    // retry and the system-camera escape hatch share one row directly above
-    // the meter, so the block never collides with the guide circle
-    CGFloat rowH = 44;
-    CGFloat rowY = meterY - 8 - rowH;
+    // two button rows sit directly above the meter: the album + save pair on the
+    // bottom row, files + camera on the one above it
+    CGFloat rowH  = 44;
+    CGFloat rowY  = meterY - 8 - rowH;
+    CGFloat row2H = 40;
+    CGFloat row2Y = rowY - 8 - row2H;
+
+    CGFloat innerW = w - insets.left - insets.right - 24;
+    CGFloat saveW  = 104;
+    CGFloat filesW = floor((innerW - 8) * 0.64);
 
     _cancelButton.frame  = CGRectMake(insets.left + 16, insets.top + 8, 68, 38);
-    _camButton.frame     = CGRectMake(w - insets.right - 16 - 72, insets.top + 8, 72, 38);
     _progressLabel.frame = CGRectMake(16, insets.top + 12, w - 32, 30);
     _hintLabel.frame     = CGRectMake(24, CGRectGetMaxY(_guide.frame) + 10, w - 48,
-                                      MAX(30, rowY - CGRectGetMaxY(_guide.frame) - 20));
-    _retryButton.frame   = CGRectMake(w - insets.right - 12 - 104, rowY, 104, rowH);
+                                      MAX(30, row2Y - CGRectGetMaxY(_guide.frame) - 20));
+    _retryButton.frame   = CGRectMake(w - insets.right - 12 - saveW, rowY, saveW, rowH);
     _manualButton.frame  = CGRectMake(insets.left + 12, rowY,
-                                      w - insets.left - insets.right - 24 - 104 - 8, rowH);
+                                      innerW - saveW - 8, rowH);
+    _filesButton.frame   = CGRectMake(insets.left + 12, row2Y, filesW, row2H);
+    _camButton.frame     = CGRectMake(insets.left + 12 + filesW + 8, row2Y,
+                                      innerW - filesW - 8, row2H);
     _meterLabel.frame    = CGRectMake(10, meterY, w - 20, meterH);
 }
 
@@ -1635,12 +1812,12 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
         [self refreshManualUI];
         return;
     }
-    _albumPicked  = n;
+    _albumPicked = n;
     __weak FUSEnrollViewController *weakSelf = self;
     __block NSUInteger pending = n;
     __block NSMutableArray *made = [NSMutableArray array];
     __block NSString *lastWhy = nil;
-    [self setHint:[NSString stringWithFormat:@"正在识别 %lu 张照片…", (unsigned long)n]];
+    [self setHint:[NSString stringWithFormat:@"正在读取 %lu 张照片…", (unsigned long)n]];
 
     // every item reports exactly once; the counter lives on the main queue so
     // no lock is needed
@@ -1650,58 +1827,259 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
             if (!ss) return;
             if (t) [made addObject:t];
             else if (why) lastWhy = why;
-            if (--pending > 0) return;
-            [ss albumImportFinished:made lastWhy:lastWhy total:n];
+            NSUInteger done = n - (pending > 0 ? pending - 1 : 0);
+            if (--pending > 0) {
+                [ss setHint:[NSString stringWithFormat:
+                    @"读取中 %lu/%lu · 成功 %lu%@",
+                    (unsigned long)done, (unsigned long)n, (unsigned long)made.count,
+                    lastWhy.length ? [@"\n最近一次失败：" stringByAppendingString:lastWhy]
+                                   : @""]];
+                return;
+            }
+            [ss importFinished:made lastWhy:lastWhy total:n];
         });
     };
 
+    dispatch_queue_t workQ = _queue;
     for (PHPickerResult *r in results) {
         NSItemProvider *ip = r.itemProvider;
-        if (!ip || ![ip canLoadObjectOfClass:[UIImage class]]) {
-            FUSLog(@"album item cannot load a UIImage");
-            step(nil, @"有一张读不出来");
-            continue;
-        }
-        dispatch_queue_t workQ = _queue;
-        [ip loadObjectOfClass:[UIImage class]
-            completionHandler:^(__kindof id<NSItemProviderReading> obj, NSError *err) {
-            UIImage *img = [obj isKindOfClass:[UIImage class]] ? (UIImage *)obj : nil;
-            if (err || !img) {
-                FUSLog(@"album load failed: %@", err);
-                step(nil, @"有一张读不出来");
+        if (!ip) { step(nil, @"有一张没有图片句柄"); continue; }
+        FUSLoadImageFromProvider(ip, ^(UIImage *img, NSString *why) {
+            if (!img) {
+                step(nil, why.length ? why : @"读不出来");
                 return;
             }
             dispatch_async(workQ, ^{
                 @autoreleasepool {
-                    NSString *why = nil;
-                    NSDictionary *t = FUSTemplateFromImage(img, &why);
-                    if (!t) FUSLog(@"album reject: %@", why);
-                    step(t, why);
+                    NSString *w = nil;
+                    NSDictionary *t = FUSTemplateFromImage(img, &w);
+                    if (!t) FUSLog(@"album reject: %@", w);
+                    step(t, w);
                 }
             });
-        }];
+        });
     }
 
-    // a provider that never calls back must not lock the album button forever
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+    // each provider gives up on its own after 15s; this only covers "the whole
+    // batch somehow never settled"
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         FUSEnrollViewController *ss = weakSelf;
         if (!ss || !ss->_albumRunning) return;
         FUSLog(@"album watchdog: %lu of %lu item(s) never reported",
                (unsigned long)pending, (unsigned long)n);
-        [ss albumImportFinished:made lastWhy:lastWhy total:n];
+        [ss importFinished:made lastWhy:lastWhy total:n];
     });
 }
 
-- (void)albumImportFinished:(NSArray *)made lastWhy:(NSString *)why total:(NSUInteger)total {
+#pragma mark - file import (no photo service, no XPC item provider)
+
+// When the album channel is refused there is still a route that asks nobody for
+// anything: a plain file.
+//   • UIDocumentPicker copies the picture into our Inbox, then we read it from
+//     disk ourselves;
+//   • and anything dropped into the app's own Documents folder (iTunes /
+//     iMazing / Filza / scp — UIFileSharingEnabled is on) is imported the
+//     moment the enroll page opens.
+// Reading a local file cannot be starved the way a capture session or an XPC
+// item provider can, so this is the path that always produces a sample.
+
+- (NSArray<NSURL *> *)localImageURLs {
+    NSMutableArray *out = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *exts = @[@"jpg", @"jpeg", @"png", @"heic", @"heif",
+                      @"tif", @"tiff", @"bmp"];
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES).firstObject;
+    if (!docs.length) return out;
+    NSArray *dirs = @[docs, [docs stringByAppendingPathComponent:@"Inbox"]];
+    for (NSString *dir in dirs) {
+        for (NSString *name in [fm contentsOfDirectoryAtPath:dir error:NULL]) {
+            if (![exts containsObject:name.pathExtension.lowercaseString]) continue;
+            [out addObject:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:name]]];
+        }
+    }
+    return out;
+}
+
+// Imported files are moved aside so re-opening the page does not add the same
+// face again and again (templates accumulate without a cap).
+- (void)retireImportedFile:(NSURL *)u {
+    NSString *p = [u isKindOfClass:[NSURL class]] ? [u path] : nil;
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES).firstObject;
+    if (!p.length || !docs.length || ![p hasPrefix:docs]) return;
+    if ([p rangeOfString:@"/imported/"].location != NSNotFound) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dstDir = [docs stringByAppendingPathComponent:@"imported"];
+    [fm createDirectoryAtPath:dstDir withIntermediateDirectories:YES attributes:nil error:NULL];
+    NSString *dst = [dstDir stringByAppendingPathComponent:p.lastPathComponent];
+    [fm removeItemAtPath:dst error:NULL];
+    NSError *e = nil;
+    if (![fm moveItemAtPath:p toPath:dst error:&e]) {
+        FUSLog(@"could not retire %@: %@", p.lastPathComponent, e.localizedDescription);
+    }
+}
+
+- (void)autoImportLocalFiles {
+    if (_finished || _albumRunning) return;
+    NSArray<NSURL *> *local = [self localImageURLs];
+    if (local.count == 0) return;
+    FUSLog(@"auto import: %lu local file(s) in the app container",
+           (unsigned long)local.count);
+    _manualMode = YES;
+    _sourceNote = @"App 文档";
+    _manualButton.hidden = NO;
+    [self refreshManualUI];
+    [self importImageURLs:local];
+}
+
+- (void)filesTapped:(UIButton *)b {
+    if (_finished || _albumRunning || _pickerUp) return;
+    // If something was already dropped into Documents there is no reason to
+    // open a picker at all.
+    NSArray<NSURL *> *local = [self localImageURLs];
+    if (local.count > 0) {
+        FUSLog(@"filesTapped: %lu local file(s)", (unsigned long)local.count);
+        _manualMode = YES;
+        _sourceNote = @"App 文档";
+        _manualButton.hidden = NO;
+        [self refreshManualUI];
+        [self importImageURLs:local];
+        return;
+    }
+    [self openDocumentPicker];
+}
+
+- (void)openDocumentPicker {
+    _albumRunning = YES;
+    _manualMode   = YES;
+    _sourceNote   = @"文件 App";
+    _linkNote     = @"document picker";
+    _manualButton.hidden = NO;
+    [self refreshManualUI];
+    [self setHint:@"正在打开「文件」…"];
+
+    __weak FUSEnrollViewController *weakSelf = self;
+    [self teardownSessionThen:^{
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss || ss->_finished) return;
+        if (ss.presentedViewController) {
+            ss->_albumRunning = NO;
+            FUSLog(@"document picker blocked by %@", ss.presentedViewController);
+            [ss setHint:@"页面还盖着别的窗口\n等一下再点"];
+            [ss refreshManualUI];
+            return;
+        }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        UIDocumentPickerViewController *dp = [[UIDocumentPickerViewController alloc]
+                     initWithDocumentTypes:@[@"public.image"]
+                                   inMode:UIDocumentPickerViewControllerInModeImport];
+#pragma clang diagnostic pop
+        dp.delegate = ss;
+        dp.allowsMultipleSelection = YES;
+        ss->_pickerUp = YES;
+        FUSLog(@"presenting the files picker");
+        [ss presentViewController:dp animated:YES completion:^{
+            FUSLog(@"files picker is up");
+        }];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            FUSEnrollViewController *s2 = weakSelf;
+            if (!s2 || s2->_finished || !s2->_pickerUp) return;
+            if (s2.presentedViewController == dp) return;
+            FUSLog(@"files picker never came up");
+            s2->_pickerUp = NO;
+            s2->_albumRunning = NO;
+            [s2 setHint:@"「文件」界面没能打开\n也可以用电脑/Filza 把照片放进 App 的 Documents 目录"];
+            [s2 refreshManualUI];
+        });
+    }];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)c
+    didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    _pickerUp = NO;
+    FUSLog(@"files picker returned %lu URL(s)", (unsigned long)urls.count);
+    if (urls.count == 0) {
+        _albumRunning = NO;
+        [self refreshManualUI];
+        [self setHint:@"没有选中文件\n再点一次「② 从「文件」选照片」"];
+        return;
+    }
+    [self importImageURLs:urls];
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)c {
+    _pickerUp = NO;
+    _albumRunning = NO;
+    FUSLog(@"files picker cancelled");
+    [self refreshManualUI];
+    NSUInteger n = _collected.count;
+    [self setHint:(n > 0
+        ? [NSString stringWithFormat:
+            @"已取消 · 已采集 %lu/%lu\n点右边「保存 %lu 张」就能完成",
+            (unsigned long)n, (unsigned long)kSamples, (unsigned long)n]
+        : @"已取消 · 还没采到样本\n点「② 从「文件」选照片」再来")];
+}
+
+- (void)importImageURLs:(NSArray<NSURL *> *)urls {
+    if (_finished || urls.count == 0) return;
+    _albumRunning = YES;
+    NSUInteger n = urls.count;
+    __weak FUSEnrollViewController *weakSelf = self;
+    __block NSUInteger pending = n;
+    __block NSMutableArray *made = [NSMutableArray array];
+    __block NSString *lastWhy = nil;
+    [self setHint:[NSString stringWithFormat:@"正在读取 %lu 个文件…", (unsigned long)n]];
+
+    void (^step)(NSDictionary *, NSString *) = ^(NSDictionary *t, NSString *why) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            FUSEnrollViewController *ss = weakSelf;
+            if (!ss) return;
+            if (t) [made addObject:t];
+            else if (why) lastWhy = why;
+            if (--pending > 0) return;
+            [ss importFinished:made lastWhy:lastWhy total:n];
+        });
+    };
+
+    dispatch_queue_t workQ = _queue;
+    for (NSURL *u in urls) {
+        dispatch_async(workQ, ^{
+            @autoreleasepool {
+                BOOL scoped = [u startAccessingSecurityScopedResource];
+                NSData *d = [NSData dataWithContentsOfURL:u];
+                UIImage *img = FUSImageFromData(d);
+                if (scoped) [u stopAccessingSecurityScopedResource];
+                if (!img) {
+                    FUSLog(@"file import: %@ undecodable (%lu bytes)",
+                           u.lastPathComponent, (unsigned long)d.length);
+                    step(nil, [NSString stringWithFormat:@"%@ 读不出来",
+                               u.lastPathComponent ?: @"文件"]);
+                    return;
+                }
+                FUSLog(@"file import: %@ %.0fx%.0f", u.lastPathComponent,
+                       img.size.width, img.size.height);
+                NSString *why = nil;
+                NSDictionary *t = FUSTemplateFromImage(img, &why);
+                if (t) [self retireImportedFile:u];
+                step(t, why);
+            }
+        });
+    }
+}
+
+- (void)importFinished:(NSArray *)made lastWhy:(NSString *)why total:(NSUInteger)total {
     if (!_albumRunning) return;      // already reported (watchdog beat us here)
     _albumRunning = NO;
     _albumDone = made.count;
     _albumBad  = (total > made.count) ? (total - made.count) : 0;
     for (NSDictionary *t in made) [_collected addObject:t];
-    FUSLog(@"album import: %lu/%lu good, total samples %lu",
+    FUSLog(@"import: %lu/%lu good, total samples %lu (source %@)",
            (unsigned long)made.count, (unsigned long)total,
-           (unsigned long)_collected.count);
+           (unsigned long)_collected.count, _sourceNote);
     [self publishMeter];
 
     if (_collected.count >= kSamples) {
@@ -1712,12 +2090,13 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
     [self refreshManualUI];
     if (made.count > 0) {
         [self setHint:[NSString stringWithFormat:
-            @"成功 %lu 张 · 现在共 %lu/%lu\n可以继续选，或点右边「保存 %lu 张」直接完成",
+            @"成功 %lu 张 · 现在共 %lu/%lu\n还可以继续选，或点右边「保存 %lu 张」直接完成",
             (unsigned long)made.count, (unsigned long)_collected.count,
             (unsigned long)kSamples, (unsigned long)_collected.count]];
     } else {
         [self setHint:[NSString stringWithFormat:
-            @"这一批一张都没成：%@\n换几张清晰正面自拍（光线亮点、别侧头）再试",
+            @"这一批一张都没成\n原因：%@\n\n换几张清晰正面自拍（光线亮、别侧头），"
+            @"或者用电脑/Filza 把照片放进 App 的 Documents 目录再进来",
             why ?: @"没检测到人脸"]];
     }
 }
@@ -1732,7 +2111,8 @@ didFinishProcessingPhoto:(AVCapturePhoto *)photo
         [self->_manualButton setTitle:@"① 从相册选照片（推荐）" forState:UIControlStateNormal];
         self->_manualButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
         self->_hintLabel.text = @"这台设备上 App 拿不到任何一帧画面（视频和拍照都是）\n"
-                                @"请点左边蓝色按钮「从相册选照片」";
+                                @"① 从相册选照片　② 从「文件」选照片\n"
+                                @"相册打不开就用 ②，或把照片放进 App 的 Documents 目录";
         [self publishMeter];
     };
     if ([NSThread isMainThread]) b(); else dispatch_async(dispatch_get_main_queue(), b);
