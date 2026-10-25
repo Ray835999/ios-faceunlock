@@ -364,7 +364,7 @@ static float FUPrefFloat(NSString *key, float def) {
     @try {
         NSDictionary *bundle = [[NSBundle mainBundle] infoDictionary];
         FUStatusSet(@"hostUp", @YES);
-        FUStatusSet(@"version", @"2.4.0");
+        FUStatusSet(@"version", @"2.5.0");
         FUStatusSet(@"hostVersion", bundle[@"CFBundleVersion"] ?: @"?");
         FUStatusSet(@"device", [[UIDevice currentDevice] systemVersion]);
         FUStatusSet(@"state", @"idle");

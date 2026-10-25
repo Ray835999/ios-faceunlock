@@ -143,7 +143,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                         color:[UIColor whiteColor]];
     [_scroll addSubview:_titleLabel];
 
-    _versionLabel = [self label:@"v2.4.0 · 单张可完成版" size:12 weight:UIFontWeightRegular
+    _versionLabel = [self label:@"v2.5.0 · App 内快门版" size:12 weight:UIFontWeightRegular
                           color:[UIColor colorWithWhite:0.6 alpha:1]];
     [_scroll addSubview:_versionLabel];
 
@@ -547,6 +547,471 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
                                        UINavigationControllerDelegate>
 @end
 
+#pragma mark - in-app shutter
+//
+// Why this class exists: UIImagePickerController with sourceType == Camera is
+// unusable on this device.  One shot works, then its own UI stops responding —
+// only the system "Cancel" button stays alive, so enrollment can never finish.
+//
+// Here every control is a UIButton we own, and the session carries nothing but
+// a camera input and an AVCapturePhotoOutput.  There is no video-data output at
+// all — that is the path that never delivered a single frame — so the still
+// path (ISP) is completely independent of it.
+
+@interface FUSShotViewController : UIViewController <AVCapturePhotoCaptureDelegate> {
+    AVCaptureSession           *_sSession;
+    AVCapturePhotoOutput       *_sPhotoOut;
+    AVCaptureVideoPreviewLayer *_sPreview;
+    dispatch_queue_t            _sSessQ;
+    dispatch_queue_t            _sWorkQ;
+    UIButton                   *_sShutter;
+    UIButton                   *_sDone;
+    UIButton                   *_sCancel;
+    UILabel                    *_sProgress;
+    UILabel                    *_sHint;
+    BOOL                        _sBusy;
+    BOOL                        _sFinished;
+    BOOL                        _sBuilding;
+    NSUInteger                  _sShots;
+    NSUInteger                  _sFails;
+    NSUInteger                  _sShotGen;
+    NSMutableArray             *_sTemplates;
+}
+
+// nil payload means "closed without new samples" (user cancelled)
+@property (nonatomic, copy) void (^onClose)(NSArray *tpls);
+
+@end
+
+@implementation FUSShotViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    FUSLog(@"shot viewDidLoad");
+    self.view.backgroundColor = [UIColor blackColor];
+    _sTemplates = [NSMutableArray array];
+    _sSessQ = dispatch_queue_create("com.ray835999.faceunlock.shot.session",
+                                    DISPATCH_QUEUE_SERIAL);
+    _sWorkQ = dispatch_queue_create("com.ray835999.faceunlock.shot.work",
+                                    DISPATCH_QUEUE_SERIAL);
+
+    _sPreview = [AVCaptureVideoPreviewLayer new];
+    _sPreview.videoGravity = AVLayerVideoGravityResizeAspectFill;
+    _sPreview.frame = self.view.bounds;
+    [self.view.layer addSublayer:_sPreview];
+
+    _sProgress = [self label:@"0 / 5" size:17 weight:UIFontWeightSemibold];
+    _sProgress.textAlignment = NSTextAlignmentCenter;
+    [self.view addSubview:_sProgress];
+
+    _sHint = [self label:@"把脸放进画面中间，然后按下面的白色圆钮" size:14
+                  weight:UIFontWeightRegular];
+    _sHint.textColor = [UIColor colorWithWhite:0.85 alpha:1];
+    _sHint.numberOfLines = 0;
+    _sHint.textAlignment = NSTextAlignmentCenter;
+    [self.view addSubview:_sHint];
+
+    _sShutter = [UIButton buttonWithType:UIButtonTypeCustom];
+    _sShutter.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.92];
+    _sShutter.layer.cornerRadius = 38;
+    _sShutter.layer.borderWidth = 3;
+    _sShutter.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.45].CGColor;
+    _sShutter.exclusiveTouch = YES;
+    [_sShutter addTarget:self action:@selector(shutterTapped:)
+        forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_sShutter];
+
+    _sDone = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_sDone setTitle:@"完成" forState:UIControlStateNormal];
+    [_sDone setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _sDone.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _sDone.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
+    _sDone.layer.cornerRadius = 8;
+    _sDone.exclusiveTouch = YES;
+    _sDone.hidden = YES;
+    [_sDone addTarget:self action:@selector(doneTapped:)
+     forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_sDone];
+
+    _sCancel = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_sCancel setTitle:@"取消" forState:UIControlStateNormal];
+    [_sCancel setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _sCancel.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    _sCancel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+    _sCancel.layer.cornerRadius = 8;
+    _sCancel.exclusiveTouch = YES;
+    [_sCancel addTarget:self action:@selector(cancelTapped:)
+       forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_sCancel];
+
+    [self buildSession];
+}
+
+- (UILabel *)label:(NSString *)text size:(CGFloat)size weight:(UIFontWeight)weight {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectZero];
+    l.text = text;
+    l.font = [UIFont systemFontOfSize:size weight:weight];
+    l.textColor = [UIColor whiteColor];
+    l.backgroundColor = [UIColor clearColor];
+    return l;
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    UIEdgeInsets insets = UIEdgeInsetsZero;
+    if (@available(iOS 11.0, *)) insets = self.view.safeAreaInsets;
+
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    _sPreview.frame = self.view.bounds;
+
+    _sCancel.frame    = CGRectMake(insets.left + 14, insets.top + 8, 68, 38);
+    _sProgress.frame  = CGRectMake(90, insets.top + 12, w - 180, 30);
+
+    CGFloat shutterY = h - insets.bottom - 96;
+    _sShutter.frame = CGRectMake((w - 76) / 2, shutterY, 76, 76);
+
+    _sHint.frame = CGRectMake(20, shutterY - 56, w - 40, 44);
+    _sDone.frame = CGRectMake(w - insets.right - 14 - 104, shutterY + 16, 104, 44);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    if (_sFinished) return;
+    [self startSession];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (_sFinished) return;
+    [self stopSessionThen:nil];
+}
+
+#pragma mark session
+
+- (void)buildSession {
+    if (_sSession || _sBuilding) return;
+    _sBuilding = YES;
+    __weak FUSShotViewController *weakSelf = self;
+    dispatch_async(_sSessQ, ^{
+        @autoreleasepool {
+            FUSShotViewController *ss = weakSelf;
+            if (!ss) return;
+            @try {
+                AVCaptureSession *s = [AVCaptureSession new];
+                s.sessionPreset = AVCaptureSessionPreset640x480;
+
+                AVCaptureDevice *dev = nil;
+                AVCaptureDeviceDiscoverySession *ds =
+                    [AVCaptureDeviceDiscoverySession
+                        discoverySessionWithDeviceTypes:@[ AVCaptureDeviceTypeBuiltInWideAngleCamera ]
+                                              mediaType:AVMediaTypeVideo
+                                               position:AVCaptureDevicePositionFront];
+                dev = ds.devices.firstObject;
+                if (!dev) dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+                if (!dev) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [ss say:@"这台设备没有可用的摄像头"];
+                    });
+                    return;
+                }
+                FUSLog(@"shot using device %@ (front=%d)", dev.localizedName,
+                       (int)(dev.position == AVCaptureDevicePositionFront));
+
+                NSError *err = nil;
+                AVCaptureDeviceInput *in = [AVCaptureDeviceInput deviceInputWithDevice:dev
+                                                                                error:&err];
+                if (!in || ![s canAddInput:in]) {
+                    FUSLog(@"shot cannot add input: %@", err);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [ss say:@"无法打开摄像头\n点右上角取消，改用相册录入"];
+                    });
+                    return;
+                }
+                [s addInput:in];
+
+                // stills only — no video-data output, that is the mute path
+                AVCapturePhotoOutput *po = [AVCapturePhotoOutput new];
+                if (![s canAddOutput:po]) {
+                    FUSLog(@"shot cannot add photo output");
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [ss say:@"这台设备不支持拍照输出\n点右上角取消，改用相册录入"];
+                    });
+                    return;
+                }
+                [s addOutput:po];
+
+                ss->_sSession  = s;
+                ss->_sPhotoOut = po;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ss->_sBuilding = NO;
+                    ss->_sPreview.session = s;
+                    FUSLog(@"shot session ready, starting");
+                    [ss startSession];
+                });
+            } @catch (NSException *e) {
+                FUSLog(@"shot build exception: %@", e.reason);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ss->_sBuilding = NO;
+                    [ss say:[NSString stringWithFormat:@"相机初始化异常：%@", e.reason ?: @"?"]];
+                });
+            }
+        }
+    });
+}
+
+- (void)startSession {
+    AVCaptureSession *s = _sSession;
+    if (!s) return;
+    if (s.isRunning) { [self say:@"对准脸，按白色圆钮"]; return; }
+    __weak FUSShotViewController *weakSelf = self;
+    dispatch_async(_sSessQ, ^{
+        @autoreleasepool {
+            @try { [s startRunning]; } @catch (NSException *e) {
+                FUSLog(@"shot startRunning exception: %@", e.reason);
+            }
+            BOOL running = s.isRunning;
+            FUSLog(@"shot session running=%d", (int)running);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                FUSShotViewController *ss = weakSelf;
+                if (!ss) return;
+                if (!running) { [ss say:@"相机没起来\n点右上角取消，改用相册录入"]; return; }
+                [ss say:@"对准脸，按白色圆钮"];
+            });
+        }
+    });
+}
+
+- (void)stopSessionThen:(void (^)(void))done {
+    AVCaptureSession *s = _sSession;
+    _sSession = nil;
+    _sPhotoOut = nil;
+    void (^after)(void) = ^{ if (done) done(); };
+    if (!s) { after(); return; }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_sPreview.session == s) self->_sPreview.session = nil;
+        dispatch_async(self->_sSessQ, ^{
+            @autoreleasepool { @try { [s stopRunning]; } @catch (NSException *e) {} }
+            dispatch_async(dispatch_get_main_queue(), after);
+        });
+    });
+}
+
+#pragma mark shutter
+
+- (void)shutterTapped:(UIButton *)b {
+    if (_sFinished || _sBusy) return;
+    if (!_sPhotoOut || !_sSession.isRunning) {
+        [self say:@"相机还没准备好，等一下再按"];
+        [self startSession];
+        return;
+    }
+    _sBusy = YES;
+    _sShots++;
+    NSUInteger gen = ++_sShotGen;
+    [self say:@"正在拍照…"];
+
+    __weak FUSShotViewController *weakSelf = self;
+    dispatch_async(_sSessQ, ^{
+        @autoreleasepool {
+            FUSShotViewController *ss = weakSelf;
+            if (!ss) return;
+            @try {
+                AVCapturePhotoSettings *st = [AVCapturePhotoSettings photoSettings];
+                // the front camera has no flash; setting it would throw
+                NSArray *modes = ss->_sPhotoOut.supportedFlashModes;
+                if ([modes isKindOfClass:[NSArray class]] &&
+                    [modes containsObject:@(AVCaptureFlashModeOff)]) {
+                    st.flashMode = AVCaptureFlashModeOff;
+                }
+                [ss->_sPhotoOut capturePhotoWithSettings:st delegate:ss];
+            } @catch (NSException *e) {
+                FUSLog(@"shot capture exception: %@", e.reason);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ss->_sBusy = NO;
+                    ss->_sFails++;
+                    [ss say:[NSString stringWithFormat:@"快门失败：%@", e.reason ?: @"?"]];
+                    [ss updateMeter];
+                });
+            }
+        }
+    });
+
+    // a still that never reports back must not lock the shutter forever
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        FUSShotViewController *ss = weakSelf;
+        if (!ss || ss->_sFinished) return;
+        if (ss->_sShotGen != gen || !ss->_sBusy) return;
+        FUSLog(@"shot watchdog: no callback in 5s");
+        ss->_sBusy = NO;
+        ss->_sFails++;
+        [ss say:@"这张没有回应\n再按一次，或点右上角取消用相册"];
+        [ss updateMeter];
+    });
+}
+
+- (void)captureOutput:(AVCaptureOutput *)output
+didFinishProcessingPhoto:(AVCapturePhoto *)photo
+               error:(NSError *)error {
+    _sBusy = NO;
+    if (error || !photo) {
+        FUSLog(@"shot delegate error: %@", error);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_sFails++;
+            [self say:@"这张没拍成\n再按一次快门"];
+            [self updateMeter];
+        });
+        return;
+    }
+
+    NSData *d = nil;
+    UIImage *img = nil;
+    @try { d = [photo fileDataRepresentation]; } @catch (NSException *e) {}
+    if (d.length) img = [UIImage imageWithData:d];
+    if (!img) {
+        FUSLog(@"shot has no usable image (data=%lu)", (unsigned long)d.length);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_sFails++;
+            [self say:@"这张照片取不出来\n再按一次快门"];
+            [self updateMeter];
+        });
+        return;
+    }
+    [self processStill:img];
+}
+
+- (void)processStill:(UIImage *)img {
+    [self say:@"识别中…"];
+    __weak FUSShotViewController *weakSelf = self;
+    dispatch_async(_sWorkQ, ^{
+        @autoreleasepool {
+            FUSShotViewController *ss = weakSelf;
+            if (!ss) return;
+            CVPixelBufferRef pb = FUSPixelBufferFromImage(img);
+            if (!pb) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ss->_sFails++;
+                    [ss say:@"照片转换失败\n再按一次快门（正对镜头、光线亮一点）"];
+                    [ss updateMeter];
+                });
+                return;
+            }
+            float q = -1.0f;
+            VNFaceObservation *face = [FacePrint detectFaceInPixelBuffer:pb
+                                                             qualityGate:NO
+                                                                 quality:&q];
+            if (!face) {
+                CVPixelBufferRelease(pb);
+                NSString *why = (q >= 0.0f)
+                    ? [NSString stringWithFormat:@"太暗/太糊（质量 %.2f）\n换个亮一点、近一点", q]
+                    : @"没检测到人脸\n正对镜头，别侧头、别低头";
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ss->_sFails++;
+                    [ss say:why];
+                    [ss updateMeter];
+                });
+                return;
+            }
+            VNFeaturePrintObservation *pr = [FacePrint observationForFace:face
+                                                              pixelBuffer:pb
+                                                                logPrefix:@"shot"];
+            CVPixelBufferRelease(pb);
+            if (!pr) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ss->_sFails++;
+                    [ss say:@"特征提取失败\n再靠近一点"];
+                    [ss updateMeter];
+                });
+                return;
+            }
+            NSDictionary *t = [FacePrint templateForPrint:pr];
+            if (!t) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ss->_sFails++;
+                    [ss say:@"特征生成失败\n再按一次快门"];
+                    [ss updateMeter];
+                });
+                return;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (ss->_sFinished) return;
+                [ss->_sTemplates addObject:t];
+                FUSLog(@"shot sample %lu/%lu collected",
+                       (unsigned long)ss->_sTemplates.count, (unsigned long)kSamples);
+                [ss updateMeter];
+                if (ss->_sTemplates.count >= kSamples) {
+                    [ss finishWithTemplates];
+                } else {
+                    [ss say:@"很好 · 稍微换个角度再按一次"];
+                }
+            });
+        }
+    });
+}
+
+- (void)doneTapped:(UIButton *)b {
+    [self finishWithTemplates];
+}
+
+- (void)finishWithTemplates {
+    if (_sFinished) return;
+    _sFinished = YES;
+    NSArray *out = [_sTemplates copy];
+    FUSLog(@"shot finishing with %lu sample(s)", (unsigned long)out.count);
+    __weak FUSShotViewController *weakSelf = self;
+    [self stopSessionThen:^{
+        FUSShotViewController *ss = weakSelf;
+        if (!ss) return;
+        void (^cb)(NSArray *) = ss.onClose;
+        [ss dismissViewControllerAnimated:YES completion:^{
+            if (cb) cb(out);
+        }];
+    }];
+}
+
+- (void)cancelTapped:(UIButton *)b {
+    if (_sFinished) return;
+    _sFinished = YES;
+    FUSLog(@"shot cancelled (%lu good)", (unsigned long)_sTemplates.count);
+    __weak FUSShotViewController *weakSelf = self;
+    [self stopSessionThen:^{
+        FUSShotViewController *ss = weakSelf;
+        if (!ss) return;
+        void (^cb)(NSArray *) = ss.onClose;
+        [ss dismissViewControllerAnimated:YES completion:^{
+            if (cb) cb(nil);
+        }];
+    }];
+}
+
+#pragma mark ui
+
+- (void)say:(NSString *)text {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_sFinished) return;
+        self->_sHint.text = text;
+    });
+}
+
+- (void)updateMeter {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_sFinished) return;
+        self->_sProgress.text = [NSString stringWithFormat:@"%lu / %lu",
+                                 (unsigned long)self->_sTemplates.count,
+                                 (unsigned long)kSamples];
+        if (self->_sTemplates.count > 0) {
+            self->_sDone.hidden = NO;
+            [self->_sDone setTitle:[NSString stringWithFormat:@"完成（%lu 张）",
+                                    (unsigned long)self->_sTemplates.count]
+                          forState:UIControlStateNormal];
+        }
+    });
+}
+
+@end
+
+
 @implementation FUSEnrollViewController {
     AVCaptureSession         *_session;
     AVCaptureVideoDataOutput *_output;
@@ -598,7 +1063,7 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    FUSLog(@"enroll viewDidLoad (v2.4.0 single-session)");
+    FUSLog(@"enroll viewDidLoad (v2.5.0 in-app shutter)");
     self.view.backgroundColor = [UIColor blackColor];
     _collected = [NSMutableArray array];
     _queue = dispatch_queue_create("com.ray835999.faceunlock.enroll", DISPATCH_QUEUE_SERIAL);
@@ -656,7 +1121,7 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     // AVCaptureSession can, so enrollment is possible even when every
     // programmatic path fails.
     _manualButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_manualButton setTitle:@"系统相机录入" forState:UIControlStateNormal];
+    [_manualButton setTitle:@"打开相机录入" forState:UIControlStateNormal];
     [_manualButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     _manualButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     _manualButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
@@ -1030,8 +1495,8 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
         [self stopPhotoPump];
         self->_manualButton.hidden = NO;
         self->_manualButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.85 alpha:1];
-        [self->_manualButton setTitle:@"点这里：用系统相机录入" forState:UIControlStateNormal];
-        self->_hintLabel.text = @"这台设备上自动取帧拿不到画面\n请点下面蓝色的按钮用系统相机录入——拍一张就能保存";
+        [self->_manualButton setTitle:@"点这里：打开相机录入" forState:UIControlStateNormal];
+        self->_hintLabel.text = @"这台设备上自动取帧拿不到画面\n请点下面蓝色的按钮，用 App 内快门拍——快门是我们自己的按钮";
         [self publishMeter];
     };
     if ([NSThread isMainThread]) b(); else dispatch_async(dispatch_get_main_queue(), b);
@@ -1041,22 +1506,21 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     if (_finished) return;
     if (_pickerUp) return;
 
-    // The system camera's shutter can go dead after the first shot: on 15.x a
-    // jailbroken process does not always get the capture device back between
-    // two pickers, and the second picker shows a greyed-out shutter.  So once
-    // one sample exists we stop re-opening the camera behind the user's back
-    // and let them choose: another shot, or a photo from the album — the album
-    // picker never touches the capture device, so it always works.
+    // The system camera UI is dead on this device: after one shot only its
+    // "Cancel" button responds.  So the shutter lives in our own view
+    // controller (FUSShotViewController) and the system camera is never opened.
+    // When samples already exist, the album stays available as a second route —
+    // it never touches the capture device, so it can never go mute.
     if (_manualMode && _collected.count > 0) {
         UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"再补一张"
-                             message:@"系统相机拍不了第二张时，从相册选最稳。"
+            alertControllerWithTitle:@"继续采集"
+                             message:@"用 App 内快门接着拍，或从相册里挑一张自拍。"
                       preferredStyle:UIAlertControllerStyleActionSheet];
         __weak FUSEnrollViewController *weakSelf = self;
-        [a addAction:[UIAlertAction actionWithTitle:@"用系统相机拍"
+        [a addAction:[UIAlertAction actionWithTitle:@"用 App 内快门拍"
                                              style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *x) {
-            [weakSelf openPicker:UIImagePickerControllerSourceTypeCamera];
+            [weakSelf openShutter];
         }]];
         if ([UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
             [a addAction:[UIAlertAction actionWithTitle:@"从相册选一张"
@@ -1072,30 +1536,117 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
         [self presentViewController:a animated:YES completion:nil];
         return;
     }
-    [self openPicker:UIImagePickerControllerSourceTypeCamera];
+    [self openShutter];
 }
 
-// Opens the system camera or the album picker.  Any capture session is torn
-// down first, so the picker is never handed a camera that is still being
-// released — that is what makes the shutter dead.
+#pragma mark - in-app shutter (the only camera UI that works here)
+
+- (void)openShutter {
+    if (_finished) return;
+    FUSLog(@"openShutter (collected %lu)", (unsigned long)_collected.count);
+    _manualMode = YES;
+    _manualButton.hidden = NO;
+    _sourceNote = @"App 快门";
+    _linkNote   = @"in-app";
+    [self stopPhotoPump];
+    [self publishMeter];
+    [self setHint:@"正在打开相机…"];
+
+    __weak FUSEnrollViewController *weakSelf = self;
+    [self teardownSessionThen:^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf presentShutter];
+        });
+    }];
+}
+
+- (void)presentShutter {
+    if (_finished) { _manualMode = NO; return; }
+    if (!self.view.window) {
+        _manualMode = NO;
+        [self setHint:@"页面不在前台，无法打开相机"];
+        return;
+    }
+    if (self.presentedViewController) {
+        FUSLog(@"presentShutter blocked by %@ (retry %lu)",
+               self.presentedViewController, (unsigned long)_presentRetries);
+        if (++_presentRetries <= 4) {
+            __weak FUSEnrollViewController *ws = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [ws presentShutter]; });
+        } else {
+            _presentRetries = 0;
+            [self setHint:@"相机页没能打开（页面还盖着别的东西）\n点左边按钮再试"];
+            [self refreshManualUI];
+        }
+        return;
+    }
+    _presentRetries = 0;
+
+    FUSShotViewController *sh = [FUSShotViewController new];
+    __weak FUSEnrollViewController *weakSelf = self;
+    sh.onClose = ^(NSArray *tpls) {
+        FUSEnrollViewController *ss = weakSelf;
+        if (!ss) return;
+        [ss handleShutterClosedWith:tpls];
+    };
+    FUSLog(@"presenting the in-app shutter");
+    [self presentViewController:sh animated:YES completion:nil];
+}
+
+- (void)handleShutterClosedWith:(NSArray *)tpls {
+    if (_finished) return;
+    NSUInteger added = 0;
+    if ([tpls isKindOfClass:[NSArray class]] && tpls.count > 0) {
+        for (NSDictionary *t in tpls) {
+            if (![t isKindOfClass:[NSDictionary class]]) continue;
+            [_collected addObject:t];
+            added++;
+        }
+    }
+    FUSLog(@"shutter closed: +%lu samples, total %lu", (unsigned long)added,
+           (unsigned long)_collected.count);
+    if (_collected.count >= kSamples) {
+        _finished = YES;
+        [self finish];
+        return;
+    }
+    [self refreshManualUI];
+    if (added > 0) {
+        [self setHint:[NSString stringWithFormat:
+            @"已采集 %lu/%lu\n点左边继续拍，或点右边先完成（少几张也能用）",
+            (unsigned long)_collected.count, (unsigned long)kSamples]];
+    } else {
+        [self setHint:[NSString stringWithFormat:
+            @"还没采到新样本 · 总计 %lu/%lu\n点左边再试，或点右边用相册",
+            (unsigned long)_collected.count, (unsigned long)kSamples]];
+    }
+}
+
+// Opens the album picker (and only that — the system camera UI is replaced by
+// FUSShotViewController, see above).
 - (void)openPicker:(UIImagePickerControllerSourceType)src {
     if (_finished) return;
     if (_pickerUp) return;
+    if (src == UIImagePickerControllerSourceTypeCamera) {
+        // safety net: the system camera must never be presented again
+        [self openShutter];
+        return;
+    }
     if (![UIImagePickerController isSourceTypeAvailable:src]) {
-        [self failWith:@"这台设备没有可用的相机 UI"];
+        [self failWith:@"这台设备没有可用的相册"];
         return;
     }
     FUSLog(@"openPicker src=%ld (collected %lu)", (long)src,
            (unsigned long)_collected.count);
     _manualMode = YES;
     _manualButton.hidden = NO;
-    _sourceNote = (src == UIImagePickerControllerSourceTypeCamera) ? @"系统相机" : @"相册";
+    _sourceNote = @"相册";
     _linkNote   = @"system UI";
     [self stopPhotoPump];
     [self publishMeter];
-    [self setHint:(src == UIImagePickerControllerSourceTypeCamera)
-                  ? @"正在打开系统相机…"
-                  : @"正在打开相册…"];
+    [self setHint:@"正在打开相册…"];
 
     __weak FUSEnrollViewController *weakSelf = self;
     [self teardownSessionThen:^{
@@ -1140,18 +1691,15 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
     _pickerUp = YES;
     UIImagePickerController *p = [UIImagePickerController new];
     p.sourceType = src;
-    if (src == UIImagePickerControllerSourceTypeCamera) {
-        p.cameraDevice = UIImagePickerControllerCameraDeviceFront;
-    }
     p.allowsEditing = NO;
     p.delegate = self;
-    FUSLog(@"presenting picker src=%ld", (long)src);
+    FUSLog(@"presenting album picker");
     [self presentViewController:p animated:YES completion:^{
-        FUSLog(@"picker is up (src=%ld)", (long)src);
+        FUSLog(@"album picker is up");
     }];
 
-    // If the picker never actually becomes the presented controller the
-    // shutter is unreachable — say so instead of leaving a dead screen.
+    // If the picker never actually becomes the presented controller, say so
+    // instead of leaving a dead screen.
     __weak FUSEnrollViewController *weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -1159,9 +1707,9 @@ static CVPixelBufferRef FUSPixelBufferFromImage(UIImage *img) {
         if (!ss || ss->_finished) return;
         if (ss.presentedViewController == p) return;
         if (!ss->_pickerUp) return;
-        FUSLog(@"picker never came up");
+        FUSLog(@"album picker never came up");
         ss->_pickerUp = NO;
-        [ss setHint:@"相机界面没能打开（摄像头还被占用）\n点左边按钮重试，或用右边按钮先完成录入"];
+        [ss setHint:@"相册没能打开\n点左边按钮重试，或用右边按钮先完成录入"];
         [ss refreshManualUI];
     });
 }
