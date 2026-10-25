@@ -8,6 +8,7 @@ on:
       - 'FacePrint.h'
       - 'FacePrint.m'
       - 'settings/**'
+      - 'layout/**'
       - 'Makefile'
       - 'control'
       - '*.plist'
